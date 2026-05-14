@@ -1,5 +1,3 @@
-# SPIKE: Deposits and Milestones — Automatic Payments
-
 > **PRD:** [Deposits + Milestones - Stripe Automatic Payments + Automatic Payment Request Notifications](https://everpro-tech.atlassian.net/wiki/x/MYBePg)
 
 ---
@@ -50,13 +48,13 @@ A merchant creates a single invoice and adds:
 
 ### Today (manual)
 
-![Diagram 1: Today (manual)](./images/image-current-payment-scheduling.webp)
+<img src="https://raw.githubusercontent.com/lenmor-invoicesimple/spike-deposits-milestones/main/images/image-current-payment-scheduling.webp" width="800" alt="Diagram 1: Today (manual)" />
 
 Due dates are informational. No automation, no reminders, no scheduled charges. Merchant follows up manually or sends checkout links.
 
 ### With Automatic Payments (Phase 1)
 
-![Diagram 2: With Automatic Payments](./images/image-proposed-auto-pay.webp)
+<img src="https://raw.githubusercontent.com/lenmor-invoicesimple/spike-deposits-milestones/main/images/image-proposed-auto-pay.webp" width="800" alt="Diagram 2: With Automatic Payments" />
 
 **Flow (successive scheduling):**
 1. Merchant creates invoice with milestones/upcoming payments (stored in Parse)
@@ -90,7 +88,7 @@ This means we can **reference the existing RP patterns** (Stripe vaulting, Event
 
 ### Recurring Payments (current architecture, for reference)
 
-![Diagram 3: Recurring Payments](./images/image-current-recurring-payment.webp)
+<img src="https://raw.githubusercontent.com/lenmor-invoicesimple/spike-deposits-milestones/main/images/image-current-recurring-payment.webp" width="800" alt="Diagram 3: Recurring Payments" />
 
 Key difference: RP is driven by `is-recurring-invoices` generating new invoices on a regular interval. Upcoming payments has no invoice generation — it's one invoice with multiple pre-set charge dates.
 

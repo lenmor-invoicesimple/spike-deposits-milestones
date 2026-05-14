@@ -708,6 +708,67 @@ This is a product/UX decision more than a technical one. The backend doesn't car
 
 ---
 
+## Decision 21: Single Row Creation (no upfront batch)
+
+**Question:** Should is-payments create `upcoming_payments` rows for ALL milestones at vault time, or only create one row at a time (the next payment)?
+
+**Context:** Original Decision 15 (successive scheduling) already limited EventBridge schedules to one-at-a-time, but still created all DB rows upfront as QUEUED. This decision goes further: don't create the rows at all until the chain reaches them.
+
+### Options
+
+**A) Create all rows upfront (QUEUED) but only schedule one** *(original design)*
+- At vault: insert N rows (1 ACTIVE, rest QUEUED)
+- On success: find next QUEUED row, create its schedule, set it ACTIVE
+- Merchant edits in Parse; system reads row to match at chain time
+
+*Pros:*
+- Full schedule visible in is-payments DB from day one (queryable)
+- Skip/cancel targets a pre-existing row
+
+*Cons:*
+- Duplicates Parse milestone data (amounts, dates) into is-payments at vault time
+- Drift risk if merchant edits milestone in Parse before its turn — row has stale snapshot
+- Write amplification: N rows created on vault even though only 1 is needed now
+- Disable/cancel cleanup: must set N QUEUED rows to INACTIVE (minor, but unnecessary work)
+
+**B) Create one row at a time — only when the chain reaches it** *(chosen)*
+- At vault: insert 1 row (ACTIVE) for the next unpaid milestone + create its schedule pair
+- On success: read next milestone from Parse, create 1 new row (ACTIVE) + schedule pair
+- No QUEUED rows exist — future milestones live only in Parse until their turn
+
+*Pros:*
+- No data duplication: Parse is the source of truth for future milestones (amounts, dates)
+- No drift risk: row is created with current Parse values when the chain reaches it
+- Simpler vault handler (create 1 row, not N)
+- Matches RP pattern more closely (each execution schedules the next)
+- Disable is trivial: at most 1 ACTIVE row to cancel (no QUEUED rows to clean up)
+- "Add/edit/delete future payment" is a pure Parse operation — no is-payments awareness needed
+
+*Cons:*
+- No is-payments DB visibility into future schedule (only next payment visible)
+- Status endpoint must read from Parse for future milestones (or mobile/web just shows Parse data for future rows)
+- If Parse is down when chain advances, next schedule isn't created (SQS retries mitigate)
+
+### Decision: B (single row creation)
+
+**Reasoning:**
+1. **Parse already owns the schedule.** Milestones (amounts, dates, order) live in Parse. Creating QUEUED rows in is-payments duplicates this data with no clear benefit.
+2. **No skip/cancel needed for QUEUED rows.** Merchant skip/cancel only applies to the NEXT payment (which has a row and a schedule). Future milestones are edited directly in Parse — no is-payments interaction needed.
+3. **No drift.** Row is created with fresh Parse values when the chain reaches it — merchant edits are always picked up.
+4. **Simpler disable.** Only 1 row to set INACTIVE + 1 schedule pair to delete. No batch cleanup.
+5. **Status endpoint is still simple.** Returns the single ACTIVE row (next charge). Future schedule comes from Parse (already loaded by mobile/web).
+
+**Impact on design doc:**
+- `createUpcomingPayment` SQS handler: creates 1 row (ACTIVE) + 1 schedule pair (not N rows)
+- handle-success: reads next milestone from Parse (via SQS payload or direct fetch), creates 1 new row + schedule
+- Status endpoint: returns current ACTIVE row only; client reads Parse for future milestones
+- QUEUED status is removed from the system (rows are either ACTIVE or INACTIVE)
+- Disable: cancel 1 schedule pair + set 1 row INACTIVE (no QUEUED cleanup)
+
+**Supersedes:** The "create all rows upfront" part of Decision 15. Successive chaining remains (one schedule at a time), but now it's also one row at a time.
+
+---
+
 ## Summary of All Decisions
 
 | # | Topic | Decision |
@@ -731,32 +792,12 @@ This is a product/UX decision more than a technical one. The backend doesn't car
 | Q4 | Schedule timezone/time | Use vault time as execution time, in client's timezone. Same infra as RP. Design may add time picker later. |
 | 12 | Reminder email lead time | TBD — how many days before due date to send "Upcoming Scheduled Payment" email (3? 7?). Per-payment EventBridge reminder schedule, created/cancelled as a pair with charge schedule. |
 | 13 | Naming convention | Use `upcoming_payment` not `milestone` in tables, schedules, topics, API paths. "Milestone" not in product copy. Pending team confirmation. |
-| 14 | Only next payment locked (revised) | Only ACTIVE (next scheduled) payment is immutable. Future QUEUED payments remain editable. Lock-all is strong alternative. Supersedes Decisions 2, 2a, 2b. |
-| 15 | Schedule in succession (revised) | Only next payment scheduled; on success, handler creates next schedule. All-at-once is strong alternative. Chain-break handled by SQS retries + DLQ. |
+| 14 | Only next payment locked (revised) | Only ACTIVE payment (has is-payments row + schedule) is immutable. Future payments remain in Parse only (editable). Lock-all is strong alternative. Supersedes Decisions 2, 2a, 2b. |
+| 15 | Schedule in succession (revised) | Only next payment scheduled; on success, handler creates next row + schedule. All-at-once is strong alternative. Chain-break handled by SQS retries + DLQ. |
+| 21 | Single row creation (no batch) | Create one `upcoming_payments` row at a time (ACTIVE only). No upfront QUEUED rows. Parse is source of truth for future milestones. Supersedes batch-creation part of Decision 15. |
 | 16 | "Pay Now" in reminder email | ⚠️ OPEN: Does "Pay Now" need a `cancel-one` endpoint, or does it just open normal checkout (re-vault/manual flow)? See Decision 16. |
 | 17 | Offline behavior | Block editing when vault active + offline (same `OfflineSectionCover` pattern as RP). No edits queued offline. |
 | 18 | Payment Scheduling UI redesign ownership | ⚠️ OPEN: Broader redesign beyond auto-pay — Payments Growth or Payments Core? Scope boundary and timing TBD. |
 | 19 | Unscheduled balance | ⚠️ OPEN: If scheduled payments don't cover 100%, remaining balance is never auto-charged. Should we warn/block? Product/UX decision. |
 | 20 | Exceeding 100% total | ⚠️ OPEN: Currently no validation prevents payments > 100% of total. With auto-pay, this means auto-overcharging. Core Payment Scheduling change needed. |
 
----
-
-## Implementation Tickets (Phase 1 only)
-
-| # | Ticket | SP | Service |
-|---|--------|---:|---------|
-| 1 | is-stripe `upcoming_payment` vault table + endpoints | 8 | is-stripe |
-| 2a | is-payments `upcoming_payments` table + SQS consumer + schedule management | 8 | is-payments |
-| 2b | is-payments upcoming payment execution Lambda | 5 | is-payments |
-| 3 | CDK infrastructure (EventBridge → SQS → Lambda) | 5 | packages/aws/cdk |
-| 4a | Checkout auto-pay UI components | 5 | is-unifiedxp |
-| 4b | Checkout vaulting integration + manual/re-vault | 5 | is-unifiedxp |
-| 5a | Mobile auto-pay status indicator + cancel | 5 | is-mobile |
-| 5b | Mobile locked editing + offline blocking + modals | 8 | is-mobile |
-| 5c | Mobile payment scheduling form validation | 5 | is-mobile |
-| 6 | Email notifications (5 templates, all lifecycle events) | 8 | is-services |
-| 7 | Feature flags, observability, E2E smoke test | 5 | cross-cutting |
-| 8 | Payment Scheduling UI redesign (placeholder — owner TBD) | 8 | is-mobile |
-| | **Total** | **75** | |
-
-Full ticket details: [2026-05-07-deposits-milestones-auto-payments-tickets.md](2026-05-07-deposits-milestones-auto-payments-tickets.md)

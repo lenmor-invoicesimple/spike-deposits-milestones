@@ -49,7 +49,7 @@ Separate tables and handlers for upcoming payments (isolation from RP). RP serve
 
 | New topic | Equivalent RP topic | Purpose |
 |-----------|---------------------|---------|
-| `createUpcomingPayment` | `createRecurringPayment` | Published by is-stripe after vault → handler creates `upcoming_payments` rows (QUEUED) + schedules NEXT payment only (ACTIVE) |
+| `createUpcomingPayment` | `createRecurringPayment` | Published by is-stripe after vault → handler creates 1 `upcoming_payments` row (ACTIVE) for the next unpaid milestone + its EventBridge schedule pair. No other rows created (Decision 21). |
 | `upcomingPaymentSuccess` | `paymentSuccess` | Published by execution Lambda on success → handler creates NEXT schedule, sends emails, logging |
 | `upcomingPaymentFailure` | `paymentFailure` | Published by execution Lambda on failure → handler manages retry scheduling, emails |
 | `upcomingPaymentReminder` | (no RP equivalent) | Published by Automatic Payment Request (reminder) schedule firing → handler sends "Upcoming Scheduled Payment" email with Pay Now CTA |
@@ -66,7 +66,7 @@ Note: No `cancelUpcomingPaymentSchedules` topic needed. Cancel-all is handled di
 | Automatic Payment Request (reminder) handler | Fires N days before due date, sends "Upcoming Scheduled Payment" email |
 | Upcoming payment SQS topics on events queue | `createUpcomingPayment`, `upcomingPaymentSuccess`, `upcomingPaymentFailure`, `upcomingPaymentReminder` |
 | CDK construct for upcoming payment execution Lambda | Same permission pattern as RP retry Lambda |
-| EventBridge schedule PAIRS (one at a time) | Charge schedule + Automatic Payment Request (reminder) schedule for NEXT payment only (successive — created after prior succeeds) |
+| EventBridge schedule PAIRS (one at a time) | Charge schedule + Automatic Payment Request (reminder) schedule for current payment only (created when chain reaches it — Decision 21) |
 
 ### Fallback
 
@@ -101,9 +101,9 @@ Vaulting happens ONCE per invoice. The single vault record covers all current an
 
 **Timezone is not stored on the vault table.** Each scheduling request (initial `createUpcomingPayment` SQS message, and subsequent `POST /upcoming-payment/add` from mobile) includes `timezone` in its payload. Mobile knows the device timezone and passes it at call time. This avoids storing it centrally and removes the need for is-payments to call back to is-stripe just to get a timezone when adding new milestones later.
 
-### is-payments: `upcoming_payments` — individual milestone schedules and amounts
+### is-payments: `upcoming_payments` — individual milestone execution records
 
-One record per scheduled milestone. Tracks execution state independently.
+One record per milestone, created only when the chain reaches it (Decision 21). At any point, at most one row per invoice has `status = ACTIVE`.
 
 ```sql
 CREATE TABLE upcoming_payments (
@@ -112,9 +112,9 @@ CREATE TABLE upcoming_payments (
   milestone_id          TEXT NOT NULL,                   -- NEW: Parse Payment remoteId — no RP equivalent
   account_id            TEXT NOT NULL,
   provider              TEXT NOT NULL DEFAULT 'stripe',
-  amount_cents          INTEGER NOT NULL,                 -- snapshot at schedule creation
+  amount_cents          INTEGER NOT NULL,                 -- snapshot at row creation time
   currency_code         TEXT NOT NULL,
-  status                TEXT NOT NULL DEFAULT 'QUEUED',  -- QUEUED | ACTIVE | INACTIVE
+  status                TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | INACTIVE (no QUEUED — Decision 21)
   retry_count           INTEGER NOT NULL DEFAULT 0,
   disabled_reason       TEXT,                            -- NEW values vs RP: MILESTONE_COMPLETED, MANUALLY_PAID
   failure_code          TEXT,
@@ -160,15 +160,14 @@ Client pays $500 deposit and vaults on May 5:
 invoice_id: "inv_abc123", customer_id: "cus_xyz", vaulted_token: "pm_xyz", payment_method_type: "card", consent_granted_at: "2026-05-05T19:30:00Z"
 ```
 
-**`upcoming_payments` (is-payments) — 1 row per upcoming milestone:**
+**`upcoming_payments` (is-payments) — 1 row only (Decision 21):**
 ```
 invoice_id    milestone_id  amount_cents  status   scheduled_date  retry_count
-"inv_abc123"  "m2"          150000        ACTIVE   2026-06-01      0    ← has EventBridge schedule
-"inv_abc123"  "m3"          300000        QUEUED   2026-07-01      0    ← no schedule yet (created after m2 succeeds)
+"inv_abc123"  "m2"          150000        ACTIVE   2026-06-01      0    ← has EventBridge schedule pair
 ```
 
-Note: `m1` (deposit) has no row — it was paid at checkout. Only remaining milestones get rows.
-**Successive scheduling (Decision 15):** Only the next payment (`m2`) has an active EventBridge schedule pair. `m3` is QUEUED — its schedule is created by the handle-success handler when `m2` completes. This gives the merchant freedom to edit `m3` (amount, date) before it gets scheduled.
+Note: `m1` (deposit) has no row — it was paid at checkout. `m3` has no row yet — it lives only in Parse until the chain reaches it.
+**Single row creation (Decision 21):** Only the next payment (`m2`) has a row + EventBridge schedule pair. When `m2` succeeds, handle-success reads `m3` from Parse (current amount/date), creates a new row (ACTIVE) + schedule pair. This means merchant can freely edit `m3` in Parse — changes are always picked up.
 
 ---
 
@@ -193,20 +192,20 @@ Client pays first payment at checkout (is-unifiedxp)
       - milestones[]: all milestone data included — no Parse fetch needed
       - consentGrantedAt: the UTC instant of vault (time-of-day used for EventBridge schedule fire time)
   → is-payments receives message:
-      1. For each milestone in the message payload:
-         - Insert `upcoming_payments` row (scheduledDate from milestone.dueDate)
-         - FIRST (soonest) unpaid milestone → status: ACTIVE
-         - All others → status: QUEUED (no EventBridge schedule yet)
-      2. For the ACTIVE milestone only:
-         - Create EventBridge CHARGE schedule: at(scheduledDate, time-of-day(consentGrantedAt)) in UTC
-         - Create EventBridge AUTOMATIC PAYMENT REQUEST (reminder) schedule: `upcoming-reminder-{invoiceId}-{paymentId}` → fires N days before due date
+      1. From milestones[] in the payload, pick the FIRST (soonest) unpaid milestone.
+      2. Create 1 `upcoming_payments` row (status: ACTIVE, amountCents/scheduledDate from milestone).
+         No other rows created — future milestones stay in Parse only (Decision 21).
+      3. Create EventBridge schedule PAIR for this milestone:
+         - CHARGE schedule: at(scheduledDate, time-of-day(consentGrantedAt)) in UTC
+         - AUTOMATIC PAYMENT REQUEST (reminder) schedule: `upcoming-reminder-{invoiceId}-{paymentId}` → fires N days before due date
          - Triggers "Upcoming Scheduled Payment" email (with "Pay Now" CTA)
          - If due date is < N days from vault → skip reminder (or send immediately — TBD)
          - ⚠️ OPEN: What is N? (3 days? 7 days?) — confirm with design
          - NOTE: timezone defaults to UTC (same as RP). Future improvement: use merchant account timezone.
-      3. QUEUED milestones get scheduled later via successive chaining (see Phase 2 success handler).
-         Merchant can freely edit QUEUED payment amounts/dates — no schedule exists for them yet.
-      4. If any upcoming payments are OVERDUE (dueDate < today):
+      4. Future milestones: no rows, no schedules. Created one-at-a-time by handle-success
+         when the chain advances (reads current values from Parse at that time).
+         Merchant can freely edit future payment amounts/dates in Parse — always picked up.
+      5. If any upcoming payments are OVERDUE (dueDate < today):
          - ⚠️ Decision 8 REVISITING (2026-05-11) — two options:
              a) Schedule for immediate execution via normal pipeline (at(now + 1min))
                 → Each gets own PaymentIntent, own webhook, own Parse write-back
@@ -244,9 +243,9 @@ Upcoming payment execution Lambda receives message:
         - idempotency_key: upcoming-{invoiceId}-{paymentId}-{YYYY-MM-DD}
      → returns { paymentIntentId, status }
      (matches RP pattern — Lambda calls is-stripe to execute, is-stripe owns vault lookup internally)
-  5a. SUCCESS (ordering matters — see Decision 15 chain-break recovery):
-      - Step 1: Find next QUEUED milestone for this invoice (by scheduledDate ASC)
-        - If found: create EventBridge schedule PAIR (charge + reminder), set status → ACTIVE
+  5a. SUCCESS (ordering matters — see Decision 21 + chain-break recovery):
+      - Step 1: Read next unpaid milestone from Parse for this invoice (by dueDate ASC, exclude already-paid)
+        - If found: create 1 new `upcoming_payments` row (ACTIVE) + EventBridge schedule PAIR (charge + reminder)
         - If none found: all payments complete, no further action
       - Step 2: Update current upcoming_payments row: status → INACTIVE, disabledReason → MILESTONE_COMPLETED
       - Step 3: Send payment confirmation email to client + payment received email to merchant
@@ -254,7 +253,8 @@ Upcoming payment execution Lambda receives message:
       (Parse Payment marked as paid automatically via Stripe webhook — no direct Parse call needed)
       
       NOTE: Step 1 BEFORE Step 2 is intentional. If Lambda fails between Step 1 and Step 2,
-      SQS retries the message. Step 1 is idempotent (same schedule name → EventBridge upserts).
+      SQS retries the message. Step 1 is idempotent (same schedule name → EventBridge upserts,
+      row insert uses UNIQUE constraint on invoice_id+milestone_id → upsert or no-op).
       Charge already succeeded (Stripe idempotency). No double-charge, no lost schedule.
   5b. FAILURE:
       - Increment retryCount
@@ -266,34 +266,33 @@ Upcoming payment execution Lambda receives message:
           - Send "retrying" notification to merchant
       - Else (max retries reached):
           - Set THIS milestone: status → INACTIVE, disabledReason → MAX_RETRIES
-          - Set all remaining QUEUED milestones for this invoice: status → INACTIVE, disabledReason → MAX_RETRIES
-          - Chain stops naturally — no future schedule gets created (no EventBridge cleanup needed for QUEUED rows)
+          - Chain stops naturally — no future row or schedule ever gets created
           - Vault record in is-stripe is kept (NOT deleted) — gets replaced if client re-vaults
           - Merchant tile reverts to non-vaulted state ("client can authorize at checkout")
           - Send failure emails to merchant + client
           - Client must check out again to re-vault and restart auto-pay
-          NOTE: With successive scheduling, max retries cleanup is simpler than all-at-once:
-            - No EventBridge schedules to delete for QUEUED payments (they never had one)
+          NOTE: With single-row creation (Decision 21), max retries cleanup is trivial:
+            - Only 1 row exists (the failed one) — set it INACTIVE
             - Only the failed payment's retry schedule (if any) needs cleanup
-            - Just a DB update: SET status = INACTIVE for remaining QUEUED rows
+            - No QUEUED rows to clean up (they were never created)
 ```
 
 ### Phase 3: Lifecycle Events (post-vault)
 
-> **Decision 14 (revised): Only the NEXT scheduled payment is locked.** With successive scheduling
-> (Decision 15), only one payment has an active EventBridge schedule at any time. That payment is
-> immutable. Future QUEUED payments remain editable (amount, date, add, delete) — their schedules
-> haven't been created yet, so changes are picked up when the chain reaches them.
+> **Decision 14 (revised): Only the NEXT scheduled payment is locked.** With single-row creation
+> (Decision 21), only one payment has an is-payments row + EventBridge schedule at any time. That payment is
+> immutable. Future payments remain in Parse only (editable: amount, date, add, delete) — no row or schedule
+> exists for them, so changes are picked up when the chain reaches them.
 
 Communication pattern: Mobile calls is-payments directly (fire-and-forget REST). See Decision Q1.
 
 ```
-Merchant edits/deletes a QUEUED (future) payment:
-  → No confirmation needed — no schedule exists for this payment
+Merchant edits/deletes a future payment (no is-payments row exists):
+  → No confirmation needed — no row or schedule exists for this payment
   → Mobile edits Parse directly (normal flow)
   → When the chain reaches this payment (prior one succeeds), handle-success reads
-    current values from Parse (amount, date) to create the schedule
-  → If payment was deleted from Parse, handle-success skips it and moves to the next QUEUED
+    current values from Parse (amount, date) to create the row + schedule
+  → If payment was deleted from Parse, handle-success skips it and moves to the next unpaid
 
 Merchant attempts to edit/delete the ACTIVE (next scheduled) payment:
   → Confirmation modal: "This will cancel the next scheduled payment. Auto-pay will
@@ -302,7 +301,7 @@ Merchant attempts to edit/delete the ACTIVE (next scheduled) payment:
       → Mobile: POST is-payments /backend/upcoming-payment/skip { invoiceId, milestoneId }
         → is-payments: delete EventBridge schedule PAIR for that payment (charge + reminder)
         → is-payments: set that row to INACTIVE, disabledReason → SKIPPED
-        → is-payments: find next QUEUED milestone, create schedule pair, set to ACTIVE
+        → is-payments: read next unpaid milestone from Parse, create new row (ACTIVE) + schedule pair
       → Mobile: proceed with Parse edit/delete as normal
   → If merchant cancels modal: no action
 
@@ -319,14 +318,15 @@ Client pays an upcoming payment via checkout link / "Pay Now" in Automatic Payme
   → Checkout (is-unifiedxp): POST is-payments /backend/upcoming-payment/cancel-one { invoiceId, milestoneId }
     → is-payments: delete EventBridge schedule PAIR for that payment (charge + reminder)
     → is-payments: set that upcoming_payments row to INACTIVE, disabledReason → MANUALLY_PAID
-    → is-payments: find next QUEUED milestone, create schedule pair, set to ACTIVE (chain advances)
+    → is-payments: read next unpaid milestone from Parse, create new row (ACTIVE) + schedule pair (chain advances)
   NOTE: Auto-pay continues — chain just advances to the next payment.
 
 Merchant or Admin cancels ALL automatic payments:
   (triggered from: Cancel AP button on invoice in mobile app, or Admin tool via support)
   → POST is-payments /backend/upcoming-payment/disable
     → Delete EventBridge schedule PAIR for ACTIVE payment (only one exists)
-    → Set all ACTIVE + QUEUED upcoming_payments rows to INACTIVE, disabledReason → USER_DISABLED
+    → Set the ACTIVE upcoming_payments row to INACTIVE, disabledReason → USER_DISABLED
+    → (No QUEUED rows to clean up — they were never created. Decision 21.)
   NOTE: Vault record is NOT deleted. Client checks out again to re-vault if needed.
   NOTE: No client self-service cancel. Client must contact merchant to cancel.
 ```
@@ -339,7 +339,7 @@ Merchant or Admin cancels ALL automatic payments:
 | `POST /backend/upcoming-payment/cancel-one` | Cancel ONE payment (paid early), advance chain | Checkout |
 | `POST /backend/upcoming-payment/skip` | Skip/cancel next ACTIVE payment, advance chain | Mobile (merchant action) |
 
-Future payments (QUEUED) are edited directly in Parse — no is-payments API needed. System reads current Parse values when creating the next schedule.
+Future payments (no is-payments row) are edited directly in Parse — no is-payments API needed. System reads current Parse values when the chain advances and creates the next row + schedule.
 
 ### Client Pays via Checkout: Manual Payment vs Re-vault
 
@@ -369,18 +369,15 @@ Scenario: Client opens checkout link to pay an upcoming payment
   CASE B — Client checks "Enable Automatic Payments" (re-vault):
     → Payment succeeds, Parse Payment marked paid via Stripe webhook
     → Cancel ALL existing schedules (retries + remaining charge/reminder pairs)
+    → Set any existing ACTIVE row to INACTIVE
     → Vault record REPLACED with new token + new consentGrantedAt
-    → Create fresh upcoming_payments rows for all UNPAID remaining payments:
-      - retryCount reset to 0
-      - FIRST (soonest) unpaid → status: ACTIVE (gets EventBridge schedule pair)
-      - All others → status: QUEUED (no schedule yet — successive, same as initial vault)
-      - scheduledDate from original due dates (unchanged)
-    → Create EventBridge schedule PAIR for NEXT payment only (charge + Automatic Payment Request)
-    → Auto-pay restarted with new card and clean slate
+    → Create 1 fresh `upcoming_payments` row for the NEXT unpaid milestone:
+      - status: ACTIVE, retryCount: 0
+      - amountCents/scheduledDate from Parse (current values)
+    → Create EventBridge schedule PAIR for that payment (charge + Automatic Payment Request)
+    → Auto-pay restarted with new card and clean slate (Decision 21 — one row at a time)
     → Client sees remaining schedule at checkout and re-consents to those specific payments
     → Rationale: fresh consent = fresh start. New card may succeed where old one failed.
-    → (Note: could alternatively schedule all-at-once on re-vault as a "fresh start" —
-       keeping successive for consistency with Decision 15, but open to revisiting.)
 ```
 
 **Example flow (max retries → re-vault):**
@@ -605,12 +602,14 @@ Handler logic:
 // 1. Fetch upcoming_payments row by (invoiceId, milestoneId) → validate status = ACTIVE
 // 2. POST is-stripe /backend/upcoming-payment/execute { invoiceId, milestoneId, amountCents }
 //    (is-stripe fetches vault internally by invoiceId)
-// 3a. Success → update row: INACTIVE, MILESTONE_COMPLETED
+// 3a. Success → read next unpaid milestone from Parse
+//              → If found: create new row (ACTIVE) + EventBridge schedule pair
+//              → Update current row: INACTIVE, MILESTONE_COMPLETED
 //              → Parse Payment marked paid via Stripe webhook (no direct Parse call)
 //              → Publish upcomingPaymentSuccess topic (for emails)
 // 3b. Failure → increment retryCount
 //              → If shouldRetry: create EventBridge retry schedule → fires back to this queue
-//              → If max retries: POST /upcoming-payment/disable (cancel ALL remaining)
+//              → If max retries: set row INACTIVE (no other rows to clean up — Decision 21)
 //              → Publish upcomingPaymentFailure topic (for emails)
 ```
 
@@ -668,11 +667,11 @@ is-stripe: create vault record
              ▼
 ┌────────────────────────────┐
 │ events-lambda              │
-│ → creates upcoming_        │
-│   payments rows (QUEUED)   │
+│ → creates 1 upcoming_      │
+│   payments row (ACTIVE)    │
+│   for next milestone       │
 │ → creates EventBridge      │
-│   schedule PAIR for NEXT   │
-│   milestone only (ACTIVE)  │
+│   schedule PAIR for it     │
 │   (charge + reminder)      │
 └────────────────────────────┘
 
@@ -837,26 +836,26 @@ Rows show different states based on scheduling status (Decision 14 revised):
 ┌─────────────────────────────────────────────┐
 │  Upcoming Payments                          │
 │                                             │
-│  Midpoint  $2,000  Due Jun 1  🔒 Scheduled │  ← ACTIVE (locked, no edit)
-│  Final     $2,000  Due Jul 1  ⚡ Auto      │  ← QUEUED (editable)
+│  Midpoint  $2,000  Due Jun 1  🔒 Scheduled │  ← ACTIVE (locked, has is-payments row)
+│  Final     $2,000  Due Jul 1  ⚡ Auto      │  ← future (editable, Parse only — no row yet)
 │                                             │
-│  [Add Upcoming Payment]                     │  ← enabled (adds as QUEUED)
+│  [Add Upcoming Payment]                     │  ← enabled (adds to Parse only)
 └─────────────────────────────────────────────┘
 ```
 
 ### Locked State (Decision 14 revised — only next payment locked)
 
-With successive scheduling, only the ACTIVE (next scheduled) payment is locked:
+With single-row creation (Decision 21), only the ACTIVE payment (which has an is-payments row + schedule) is locked:
 
-1. **ACTIVE row (next scheduled):** Edit/delete disabled. Shows "Scheduled for [date]" badge. Actions available:
-   - "Skip this payment" → confirmation → `POST /skip` → chain advances to next QUEUED
+1. **ACTIVE payment (has is-payments row + schedule):** Edit/delete disabled. Shows "Scheduled for [date]" badge. Actions available:
+   - "Skip this payment" → confirmation → `POST /skip` → chain advances (creates next row + schedule)
    - "Disable All Automatic Payments" → confirmation → `POST /disable` → full reset
-2. **QUEUED rows (future):** Fully editable. Edit amount, date, add new, delete — all normal.
+2. **Future payments (Parse only, no is-payments row):** Fully editable. Edit amount, date, add new, delete — all normal.
    No confirmation needed. System reads current Parse values when the chain reaches them.
-3. **"Add Upcoming Payment" button:** Enabled (new payment is added as QUEUED).
+3. **"Add Upcoming Payment" button:** Enabled (new payment added to Parse only).
 
 "Mark as Paid" on the ACTIVE payment → "Skip this payment" confirmation → chain advances.
-"Mark as Paid" on a QUEUED payment → no confirmation, just mark in Parse (chain skips it later).
+"Mark as Paid" on a future payment → no confirmation, just mark in Parse (chain skips it naturally).
 
 ### Merchant Flows
 
@@ -864,43 +863,45 @@ With successive scheduling, only the ACTIVE (next scheduled) payment is locked:
 
 **Skip next payment:** Merchant taps "Skip" on the ACTIVE payment → confirmation: "This will cancel the next scheduled payment. Auto-pay will continue with the following payment." → `POST /skip` → chain advances to next QUEUED payment.
 
-**Disable all:** Merchant taps "Disable Automatic Payments" → confirmation: "This will cancel all scheduled payments. Your client will need to set up auto-pay again at their next checkout." → full reset: cancel ACTIVE payment's EventBridge schedule pair, set all ACTIVE + QUEUED rows INACTIVE with reason `USER_DISABLED`. Vault record kept (not deleted) — gets replaced on re-vault. (Note: vault deletion may be added later for consistency with incoming RP work.)
+**Disable all:** Merchant taps "Disable Automatic Payments" → confirmation: "This will cancel all scheduled payments. Your client will need to set up auto-pay again at their next checkout." → full reset: cancel ACTIVE payment's EventBridge schedule pair, set the ACTIVE row INACTIVE with reason `USER_DISABLED`. No QUEUED rows to clean up (Decision 21). Vault record kept (not deleted) — gets replaced on re-vault. (Note: vault deletion may be added later for consistency with incoming RP work.)
 
 ### Data Requirements
 
 ```typescript
 type AutoPayStatus = {
   vaulted: boolean
-  scheduledPayments: Array<{
+  activePayment?: {                    // from is-payments (the single ACTIVE row)
     milestoneId: string
     amountCents: number
     scheduledDate: string
-    status: 'QUEUED' | 'ACTIVE' | 'INACTIVE'
+    status: 'ACTIVE'
+    retryCount: number
     disabledReason?: string
-  }>
-  nextCharge?: {
+  }
+  completedPayments: Array<{           // from is-payments (INACTIVE rows — history)
     milestoneId: string
     amountCents: number
-    scheduledDate: string
-  }
+    disabledReason: string             // MILESTONE_COMPLETED, SKIPPED, etc.
+  }>
 }
+// Future milestones (not yet scheduled) come from Parse — already loaded by mobile/web
 ```
 
 Fetched from: `GET /backend/upcoming-payment/status?invoiceId={id}` (is-payments endpoint)
 
-**UI uses `status` to determine editability:**
-- `ACTIVE` → locked row (🔒 badge, edit/delete disabled, "Skip" action available)
-- `QUEUED` → editable row (⚡ badge, normal edit/delete controls)
-- `INACTIVE` → completed/cancelled (greyed out or hidden)
+**UI uses is-payments + Parse data together to determine editability:**
+- **ACTIVE row (from is-payments)** → locked row (🔒 badge, edit/delete disabled, "Skip" action available)
+- **Future milestones (from Parse, no is-payments row yet)** → editable row (⚡ badge, normal edit/delete controls)
+- **INACTIVE rows (from is-payments)** → completed/cancelled (greyed out or hidden)
 
 ### High-Level Web Plan
 
 Same concepts apply to web (is-web-app):
 - New `AutomaticPaymentsSection` in `nextjs/components/invoice-editor/invoice-payment/payment-scheduling/`
-- Schedule badges: 🔒 Scheduled (ACTIVE, locked) vs ⚡ Auto (QUEUED, editable)
-- Only ACTIVE (next) payment locked — QUEUED rows fully editable
+- Schedule badges: 🔒 Scheduled (ACTIVE, has is-payments row) vs ⚡ Auto (future, Parse only)
+- Only ACTIVE (next) payment locked — future milestones fully editable in Parse
 - "Skip" action on ACTIVE row, "Disable All" as nuclear option
-- "Add Upcoming Payment" enabled (new payments are QUEUED)
+- "Add Upcoming Payment" enabled (adds to Parse only)
 - Offline: not applicable (web always online)
 - Same is-payments API endpoints for status/skip/disable
 
@@ -1013,13 +1014,13 @@ Deposits have no due date (by design — paid at checkout). A non-deposit milest
 
 **Behavior:** If somehow a milestone has no due date, no schedule is created. It stays as a manual upcoming payment. UI nudges merchant: "Add a due date to enable automatic payment for this milestone."
 
-### Merchant edits a QUEUED (future) payment while vault is active
+### Merchant edits a future payment while vault is active
 
-Per Decision 14 (revised), future QUEUED payments are **freely editable**. No confirmation, no API call to is-payments. Merchant edits directly in Parse. When the chain reaches that payment, handle-success reads the current values (amount, date) from the SQS payload (or fetches from Parse) to create the schedule.
+Per Decision 14 (revised) + Decision 21, future payments (no is-payments row) are **freely editable**. No confirmation, no API call to is-payments. Merchant edits directly in Parse. When the chain reaches that payment, handle-success reads the current values (amount, date) from Parse to create the row + schedule.
 
 ### Merchant edits the ACTIVE (next scheduled) payment while vault is active
 
-The ACTIVE payment is immutable (EventBridge schedule already created). Merchant must confirm: "This will skip this payment. Auto-pay continues with the next one." → `POST /backend/upcoming-payment/skip` → chain advances.
+The ACTIVE payment is immutable (has is-payments row + EventBridge schedule). Merchant must confirm: "This will skip this payment. Auto-pay continues with the next one." → `POST /backend/upcoming-payment/skip` → chain advances (creates new row + schedule for next unpaid milestone from Parse).
 
 ### Negative balance / overpayment (pre-existing, not auto-pay specific)
 
@@ -1052,7 +1053,7 @@ Request:
   invoiceId: string
   accountId: string
   provider: "stripe"
-  milestones: [
+  milestones: [                    // all unpaid milestones included — only the FIRST (soonest) gets a row + schedule (Decision 21)
     {
       milestoneId: string        // Parse Payment remoteId
       amountCents: number        // resolved at call time
@@ -1068,7 +1069,7 @@ Request:
 }
 
 Response (201):
-{ success: true, data: { invoiceId: string, scheduledCount: number } }
+{ success: true, data: { invoiceId: string, scheduledMilestoneId: string } }
 ```
 
 #### Get upcoming payment status
@@ -1087,18 +1088,21 @@ Response (200):
     vaulted: boolean
     // V1: paymentMethodType and paymentMethodLast4 stored but NOT returned.
     // Mobile shows "Auto-pay enabled" without card details (same as RP).
-    milestones: [
+    activePayment?: {              // the single ACTIVE row (null if none scheduled)
+      milestoneId: string
+      amountCents: number
+      scheduledDate: string
+      retryCount: number
+      lastExecutedAt?: string
+    }
+    completedPayments: [           // INACTIVE rows (history — MILESTONE_COMPLETED, SKIPPED, etc.)
       {
         milestoneId: string
         amountCents: number
-        scheduledDate: string
-        status: "QUEUED" | "ACTIVE" | "INACTIVE"
-        disabledReason?: string
-        retryCount: number
-        lastExecutedAt?: string
+        disabledReason: string
       }
     ]
-    nextCharge?: { milestoneId: string, amountCents: number, scheduledDate: string }
+    // Future milestones (not yet scheduled) are NOT in this response — client reads from Parse
   }
 }
 
@@ -1178,7 +1182,7 @@ Response (200):
 }
 ```
 
-Cancels the ACTIVE payment's EventBridge schedule pair, sets it INACTIVE with reason `SKIPPED`, then finds next QUEUED payment and creates its schedule pair (chain advances). If no QUEUED payments remain, auto-pay is effectively complete.
+Cancels the ACTIVE payment's EventBridge schedule pair, sets it INACTIVE with reason `SKIPPED`, then reads the next unpaid milestone from Parse, creates a new row (ACTIVE) + schedule pair (chain advances). If no unpaid milestones remain, auto-pay is effectively complete.
 
 #### Disable all upcoming payments (full reset)
 
@@ -1196,7 +1200,7 @@ Response (200):
 { success: true, data: { disabledCount: number } }
 ```
 
-Disables ALL upcoming payments (ACTIVE + QUEUED), cancels the one active EventBridge schedule pair. Vault record is kept (not deleted) — gets replaced on re-vault. (Note: vault deletion may be added later for consistency with incoming RP work; if so, delete here too.) Nuclear option — merchant must use this for invoice-level edits or full cancellation.
+Disables the ACTIVE upcoming payment (sets INACTIVE), cancels its EventBridge schedule pair. No QUEUED rows to clean up (Decision 21 — they were never created). Vault record is kept (not deleted) — gets replaced on re-vault. (Note: vault deletion may be added later for consistency with incoming RP work; if so, delete here too.) Nuclear option — merchant must use this for invoice-level edits or full cancellation.
 
 #### Cancel single upcoming payment (client pays early via checkout)
 
@@ -1224,7 +1228,7 @@ Response (200):
 }
 ```
 
-Cancels the payment's schedule (if ACTIVE), sets INACTIVE, and advances the chain — finds next QUEUED payment and creates its schedule pair. Auto-pay continues with remaining payments.
+Cancels the payment's schedule (if ACTIVE), sets INACTIVE, and advances the chain — reads next unpaid milestone from Parse, creates a new row (ACTIVE) + schedule pair. Auto-pay continues with remaining payments.
 
 ---
 
