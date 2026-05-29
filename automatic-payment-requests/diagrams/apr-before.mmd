@@ -1,0 +1,46 @@
+---
+title: "BEFORE — Current Reminder Systems (No APR)"
+---
+flowchart TB
+    subgraph Merchant["Merchant Action"]
+        M1[Sends Invoice Email]
+        M2[Client views checkout]
+    end
+
+    subgraph IsApi["is-api (legacy)"]
+        A1[insertMsg to PostgreSQL<br/>suppress_reminder = false]
+        A2[createParseMsg in MongoDB]
+        A3[Queue email via @is/messaging]
+    end
+
+    subgraph IsMessages["is-messages"]
+        B1[Email delivered to client via Mailgun]
+        B2["Cron: every 30 min<br/>SELECT WHERE opened_dt IS NULL<br/>AND created_dt > 2 days"]
+        B3["Send 'Unopened Invoice' reminder"]
+    end
+
+    subgraph AbandonedCart["is-abandoned-cart (is-services)"]
+        C1["EventBridge: checkout-viewed event"]
+        C2["Schedule: 30 min + 3 days"]
+        C3["Check PaymentReminders setting"]
+        C4["Send 'Complete Payment' email<br/>via @is/messaging → is-messages"]
+    end
+
+    subgraph Client["Client"]
+        D1["Receives invoice email"]
+        D2["Does NOT open / pay"]
+        D3["Gets reminder: 'Unopened invoice'<br/>(2-4 days after send)"]
+        D4["Gets reminder: 'Complete Payment'<br/>(30min + 3 days after checkout view)"]
+    end
+
+    M1 --> A1 --> A3 --> B1 --> D1
+    M1 --> A2
+    D1 --> D2
+    D2 -.->|2+ days pass, unopened| B2 --> B3 --> D3
+
+    M2 --> C1 --> C2 --> C3 -->|enabled| C4 --> D4
+
+    style B2 fill:#f9e79f,stroke:#f39c12
+    style C2 fill:#f9e79f,stroke:#f39c12
+    style D3 fill:#fadbd8,stroke:#e74c3c
+    style D4 fill:#fadbd8,stroke:#e74c3c

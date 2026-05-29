@@ -91,9 +91,51 @@ Today, after the deposit is paid, the invoice still shows the original due date 
 
 ---
 
-## 4. Checkout Reads `balanceDue` Directly
+## 4. Checkout → Milestone Linking: Explicit `paymentId`, Not Amount Matching
 
-Checkout (is-unifiedxp) doesn't need to know about deposits vs milestones. It reads `Invoice.balanceDue` and charges that amount. The sequential milestone chaining happens transparently through the calculator.
+When a client pays at checkout, the system uses an explicit Payment record ID — it does NOT match by amount.
+
+### Flow:
+
+```
+1. Checkout loads
+   → getUpcomingPayment() fetches all Payment records for the invoice
+   → getNearestUpcomingPayment() picks the soonest unpaid one
+   → Returns the milestone's objectId
+
+2. Client clicks "Pay"
+   → Stripe PaymentIntent created with: paymentId = milestone.objectId
+   → PaymentIntent record stored in DB with that paymentId
+
+3. Stripe payment succeeds (webhook)
+   → Webhook retrieves PaymentIntent record
+   → Extracts paymentId
+
+4. If paymentId exists (milestone payment):
+   → invoicePaymentsUpdate({ payment: { objectId: paymentId, date: now } })
+   → Marks THAT specific Payment record as completed (sets date)
+
+   If no paymentId (ad-hoc payment):
+   → invoiceAddPayment() → creates a NEW Payment record
+```
+
+### Key decision point in is-stripe webhook handler:
+
+```typescript
+const isUpcomingPayment = !!paymentId;
+
+if (isUpcomingPayment) {
+  // UPDATE existing milestone record
+  await invoicePaymentsUpdate({ invoiceId, payment: { ...payment, objectId: paymentId } });
+} else {
+  // CREATE new payment record
+  await invoiceAddPayment({ invoiceId, payment });
+}
+```
+
+### Why this matters for auto-pay:
+
+Auto-pay replicates this same pattern — identify the next milestone by `objectId` at schedule time, pass it through to the charge execution, and mark it completed via `invoicePaymentsUpdate`. No amount-matching needed.
 
 ---
 
@@ -114,9 +156,12 @@ The hard part isn't "what to charge" or "which milestone" — the existing syste
 | What | Where |
 |---|---|
 | Balance calculation | `@invoice-simple/calculator` → `getInvoiceBalance()`, `getNearestUpcomingPayment()` |
-| Backend balance update | `is-parse-server/cloud/collections/invoice/utils/updatePaymentDetails.ts` |
-| Payment completion | `is-parse-server/cloud/collections/invoice/utils/addPaymentToInvoice.ts` |
-| Payment creation | `is-parse-server/cloud/collections/invoice/functions/invoiceAddPayment.ts` |
-| Payment → common format | `is-parse-server/cloud/collections/payment/utils/parsePaymentToCommonPayment.ts` |
+| Backend balance update | `is-parse-server/.../invoice/utils/updatePaymentDetails.ts` |
+| Payment completion (mark paid) | `is-parse-server/.../invoice/utils/addPaymentToInvoice.ts` |
+| Payment creation (cloud fn) | `is-parse-server/.../invoice/functions/invoiceAddPayment.ts` |
+| Payment → common format | `is-parse-server/.../payment/utils/parsePaymentToCommonPayment.ts` |
+| Checkout: get next milestone | `is-services/.../is-unifiedxp/src/utils/parse/get-upcoming-payment.ts` |
+| Checkout: pass paymentId to Stripe | `is-services/.../is-unifiedxp/src/components/StripeCheckout/useStripePaymentIntent.ts` |
+| Stripe webhook: mark milestone paid | `is-services/.../is-stripe/src/routes/...payment-intent-updated.ts` |
 | Mobile balance display | `is-mobile/src/features/upcoming-payments/section/invoice-total-section.tsx` |
 | Web balance display | `is-web-app/client/src/models/InvoiceModel.ts` |

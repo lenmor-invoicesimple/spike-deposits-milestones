@@ -55,6 +55,72 @@ Functionally almost identical — both are scheduled, unpaid milestones stored t
 
 ---
 
+## Recording Payments: Mark as Paid vs. Record Payment
+
+Both produce a completed payment in the same `Payment` collection. The difference is the entry point and whether a prior "upcoming" document existed.
+
+| | Mark as Paid | Record Payment (Historical) |
+|---|---|---|
+| **API** | `invoiceUpdatePayment` (updates existing doc) | `addHistoricalPayments` (creates new doc) |
+| **Prior document** | Yes — an existing upcoming Payment row gets `amount`/`date`/`method` added | No — a fresh Payment document is created directly as completed |
+| **Has scheduling fields** (`paymentType`, `paymentMode`, `paymentValue`) | Yes — inherited from the upcoming payment | No — absent |
+| **Has `dueDate`** | Yes — preserved from when it was scheduled | No |
+| **Use case** | Customer pays a previously scheduled milestone | Record a payment that was received outside of the scheduling flow (e.g. cash, check) |
+
+Once completed, both look identical in the UI's "Payment History" section. The only way to distinguish them in the database is whether the scheduling fields (`paymentType`, `paymentMode`, `paymentValue`, `dueDate`) are present.
+
+### MongoDB Field Comparison — How to Identify Payment Type in the Database
+
+| Field | Deposit (upcoming) | Milestone (upcoming) | Deposit — Mark as Paid (manual) | Deposit — Paid via Checkout | Milestone — Mark as Paid (manual) | Milestone — Paid via Checkout | Historical/Record Payment |
+|---|---|---|---|---|---|---|---|
+| `paymentType` | `1` (DEPOSIT) | `0` (NONE) | `1` (DEPOSIT) | `1` (DEPOSIT) | `0` (NONE) | `0` (NONE) | **absent** |
+| `paymentMode` | `1` (PERCENT) or `2` (FLAT) | `1` or `2` | `1` or `2` | `1` or `2` | `1` or `2` | `1` or `2` | `1` or `2` (user picks in form) |
+| `paymentValue` | e.g. `20` (%) or `400` ($) | e.g. `50` or `200` | preserved | preserved | preserved | preserved | present (user picks in form) |
+| `dueDate` | absent (deposits hide due date) | present | absent (preserved if was set) | absent (preserved if was set) | present (preserved) | present (preserved) | absent |
+| `amount` | **absent** | **absent** | present | present | present | present | present |
+| `date` | **absent** | **absent** | present | present | present | present | present |
+| `method` | `"other"` (hook default) | `"other"` (hook default) | user selection (e.g. `"cash"`, `"check"`) | `"card"`, `"us_bank_account"` | user selection (e.g. `"cash"`, `"check"`) | `"card"`, `"us_bank_account"` | user selection (e.g. `"cash"`, `"card"`) |
+| `provider` | absent | absent | absent | `"stripe"` or `"paypal"` | absent | `"stripe"` or `"paypal"` | absent |
+| `transactionId` | absent | absent | auto-generated UUID | Stripe PI / PayPal order ID | auto-generated UUID | Stripe PI / PayPal order ID | auto-generated UUID |
+| `label` | `"Deposit"` | `"Payment"` | `"Deposit"` | `"Deposit"` | `"Payment"` | `"Payment"` | `"Payment"` |
+| `notes` | absent | absent | optional (user-entered) | auto: `"Paid online via Stripe..."` | optional (user-entered) | auto: `"Paid online via Stripe..."` | optional (user-entered) |
+| `surcharge` | absent | absent | `0` | processing fee if applicable | `0` | processing fee if applicable | `0` |
+| `payer`/`payerObj` | absent | absent | absent | `{ email: "buyer@..." }` | absent | `{ email: "buyer@..." }` | absent |
+| `deleted` | `false` | `false` | `false` | `false` | `false` | `false` | `false` |
+
+**The single distinguishing field for historical payments is `paymentType`: it is ABSENT.** Both deposits (`paymentType: 1`) and milestones (`paymentType: 0`) always have this field set. Historical payments share `paymentMode` and `paymentValue` (because the Record Payment form asks the user to pick Percent/Flat), but never get `paymentType` assigned.
+
+**Quick identification rules for Mongo queries:**
+
+| You're looking for... | Query filter |
+|---|---|
+| All upcoming (unpaid) payments | `{ amount: { $exists: false } }` |
+| All completed payments | `{ amount: { $exists: true } }` |
+| Deposits (any state) | `{ paymentType: 1 }` |
+| Milestones (any state) | `{ paymentType: 0 }` |
+| Historical/recorded payments (never scheduled) | `{ amount: { $exists: true }, paymentType: { $exists: false } }` |
+| Paid via checkout (online) | `{ provider: { $exists: true } }` |
+| Manually marked as paid (was scheduled) | `{ amount: { $exists: true }, provider: { $exists: false }, paymentType: { $exists: true } }` |
+| Soft-deleted | `{ deleted: true }` |
+
+### Lifecycle Diagram
+
+```
+[Upcoming Payment]                    [Record Payment]
+       │                                     │
+       │ invoiceUpdatePayment                │ addHistoricalPayments
+       │ (add amount/date/method)            │ (create with amount/date/method)
+       ▼                                     ▼
+┌─────────────────────────────────────────────────┐
+│          Completed Payment (Payment History)     │
+│  - Reduces Balance Due                          │
+│  - Copied into Invoice.payments[] subdocument   │
+│  - Triggers bookkeeping sync (if enabled)       │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
 ## Balance Calculation
 
 ```

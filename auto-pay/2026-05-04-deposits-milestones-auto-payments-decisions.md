@@ -682,13 +682,33 @@ Placeholder ticket (Ticket 8, 8 SP) created. Blocking questions: team ownership,
 - What if the merchant never adds more upcoming payments — does the vault eventually expire or just sit indefinitely?
 - Is this a Phase 1 concern, or fine to leave as-is (same as today's manual behavior) for now?
 
-### Decision: ⚠️ OPEN — to confirm with team
+### Decision: Automate only explicitly scheduled milestones; remaining balance reverts to manual payment ✅ RESOLVED (2026-05-29)
 
-This is a product/UX decision more than a technical one. The backend doesn't care — it only schedules what exists. But the user experience may be confusing if auto-pay is "active" but a chunk of the invoice will never be collected automatically.
+> Slack thread: https://ec-mobile-solutions.slack.com/archives/C0B331AP0BY/p1779994686.931629
+> Seth: "I'm gonna lean towards automating only milestones that have been explicitly scheduled and revert back to manual payments if there is a remaining invoice balance."
+
+**Reasoning:** Merchants may intentionally schedule only milestones with hard deadlines, without the goal of automating the full invoice balance. The remaining balance is the merchant's discretion — they can send a checkout link or mark as paid via other methods.
+
+**Behavior:**
+1. Auto-pay fires for all scheduled milestones on their dates
+2. After the last scheduled milestone succeeds, the schedule completes (no more ACTIVE rows or EventBridge schedules)
+3. `invoice.balanceDue` already reflects only the unscheduled remainder (updated naturally by each successful payment via Stripe webhook → Parse `invoiceAddPayment`)
+4. Client pays remaining balance manually via checkout (sees current `balanceDue`, pays normally)
+5. No re-vault needed for manual payment — client just goes to checkout
+
+**No special logic needed:**
+- Schedule system is purely milestone-driven — doesn't track or reason about `invoice.total`
+- No "auto-generate remaining balance milestone" logic
+- No vault-aware balance tracking
+- Existing checkout already handles partial payment (shows current `balanceDue`)
+
+**If merchant wants to auto-pay new milestones added after schedule completes:**
+- Client would need to re-vault (new consent for new amounts/dates)
+- This is correct from a consent perspective — buyer consented to specific payments, not open-ended future ones
 
 ---
 
-## Decision 20: Exceeding 100% Total — Payment Scheduling Validation
+## Decision 20: Exceeding 100% Total — Payment Scheduling Validation (Overpayment Gate)
 
 **Question:** Currently, Payment Scheduling allows creating payments that exceed the invoice total (e.g., 60% + 60% = 120%). If both are marked paid, the balance goes negative. Should we add validation to prevent this?
 
@@ -702,9 +722,30 @@ This is a product/UX decision more than a technical one. The backend doesn't car
 - **C) Warn but don't block** — Show warning when > 100%, let merchant proceed if they want.
 - **D) Leave as-is for Phase 1** — Document the risk, fix in a later phase. Same as today.
 
-### Decision: ⚠️ OPEN — to confirm with team
+### Decision: B — Block vaulting if milestones sum > invoice total ✅ RESOLVED (2026-05-29)
 
-**Note:** This is a change to core Payment Scheduling functionality, not just auto-pay. May require coordination with Payments Core team (see Decision 18). Needs product/design input on whether to block vs. warn.
+> Slack thread: https://ec-mobile-solutions.slack.com/archives/C0B331AP0BY/p1779994686.931629
+> Seth: "My initial take is that we should block vaulting if the sum of the scheduled milestones exceed the invoice total."
+
+**Reasoning:**
+- Merchants wouldn't intentionally schedule more than the total (typo/error prevention)
+- Mitigates chargebacks — buyer never auto-charged beyond invoice balance
+- Surfaces an actionable warning to the merchant rather than silently allowing overcharge
+
+**Behavior:**
+- At vault time (checkout), validate: `sum(unpaid milestone amounts) <= invoice.total`
+- If sum exceeds total: auto-pay opt-in is hidden/disabled at checkout
+- Merchant sees inline warning on Payment Scheduling screen: "Automatic payments unavailable — scheduled payments exceed the invoice total. Adjust payment amounts to enable."
+- Manual payments still allowed (same as today) — only auto-pay is blocked
+
+**Implementation:**
+- Validation lives in checkout (is-unifiedxp) where auto-pay opt-in is rendered
+- Simple comparison: `sumMilestoneAmounts > invoiceTotal` → hide/disable opt-in
+- No backend (is-payments, is-stripe) involvement — pure UI/checkout gate
+- Does NOT change core Payment Scheduling forms (milestones can still exceed total for manual use)
+- This is Option B: existing behavior preserved for manual payments, only auto-pay gated
+
+**Note:** This does NOT fix the underlying Payment Scheduling quirk (no max validation on forms). That remains a separate concern for Payments Core (Decision 18). This decision only prevents the auto-pay system from auto-overcharging.
 
 ---
 
@@ -798,6 +839,6 @@ This is a product/UX decision more than a technical one. The backend doesn't car
 | 16 | "Pay Now" in reminder email | ⚠️ OPEN: Does "Pay Now" need a `cancel-one` endpoint, or does it just open normal checkout (re-vault/manual flow)? See Decision 16. |
 | 17 | Offline behavior | Block editing when vault active + offline (same `OfflineSectionCover` pattern as RP). No edits queued offline. |
 | 18 | Payment Scheduling UI redesign ownership | ⚠️ OPEN: Broader redesign beyond auto-pay — Payments Growth or Payments Core? Scope boundary and timing TBD. |
-| 19 | Unscheduled balance | ⚠️ OPEN: If scheduled payments don't cover 100%, remaining balance is never auto-charged. Should we warn/block? Product/UX decision. |
-| 20 | Exceeding 100% total | ⚠️ OPEN: Currently no validation prevents payments > 100% of total. With auto-pay, this means auto-overcharging. Core Payment Scheduling change needed. |
+| 19 | Unscheduled balance | Automate only scheduled milestones; remaining balance reverts to manual. No special logic — `balanceDue` updated naturally, client pays remainder via checkout. |
+| 20 | Exceeding 100% total (overpayment gate) | Block vaulting if `sum(milestones) > invoice.total`. Checkout hides/disables auto-pay opt-in. Merchant sees warning. Manual payments unaffected. |
 

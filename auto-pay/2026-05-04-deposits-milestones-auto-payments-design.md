@@ -1022,6 +1022,52 @@ Per Decision 14 (revised) + Decision 21, future payments (no is-payments row) ar
 
 The ACTIVE payment is immutable (has is-payments row + EventBridge schedule). Merchant must confirm: "This will skip this payment. Auto-pay continues with the next one." → `POST /backend/upcoming-payment/skip` → chain advances (creates new row + schedule for next unpaid milestone from Parse).
 
+### Vault-time validation: overpayment gate & remaining balance (Decision 2026-05-29)
+
+> Decided in Slack thread: https://ec-mobile-solutions.slack.com/archives/C0B331AP0BY/p1779994686.931629
+> Participants: Lenmor, Liz, Seth
+
+**Overpayment gate — block vaulting if milestones sum > invoice total:**
+
+At vault time, checkout validates: `sum(milestone.amountCents for all unpaid milestones) <= invoice.total`. If the sum exceeds the invoice total, vaulting is blocked:
+- Client does NOT see the auto-pay opt-in checkbox (or it's disabled with explanation)
+- Merchant sees an inline warning on the Payment Scheduling screen: "Automatic payments unavailable — scheduled payments exceed the invoice total. Adjust payment amounts to enable."
+- Rationale: merchants wouldn't intentionally schedule more than the total (typo prevention), and this mitigates chargebacks (buyer never auto-charged beyond invoice balance)
+
+**Remaining balance — milestones don't cover full invoice total:**
+
+When `sum(milestones) < invoice.total`, vaulting is allowed. Auto-pay only charges the explicitly scheduled milestones. The remaining balance is handled manually:
+
+| Scenario | Behavior |
+|----------|----------|
+| `sum(milestones) > invoice.total` | Block vaulting, show warning to merchant |
+| `sum(milestones) < invoice.total` | Allow vaulting, auto-pay scheduled milestones only, remaining = manual |
+| `sum(milestones) = invoice.total` | Happy path, full automation |
+
+**What happens after all scheduled milestones complete:**
+1. Last milestone fires and succeeds
+2. `handle-success` reads next unpaid milestone from Parse → finds none → no new row/schedule created
+3. Auto-pay is effectively complete (no more ACTIVE rows, no more schedules)
+4. `invoice.balanceDue` reflects only the unscheduled remainder (already updated by successful milestone payments via Stripe webhooks → Parse `invoiceAddPayment`)
+5. Client can pay remaining balance manually via checkout link (normal flow, no re-vault needed)
+
+**No special remaining-balance logic needed:**
+- The schedule system is purely milestone-driven — it doesn't track or reason about `invoice.total`
+- `invoice.balanceDue` is updated naturally by each successful payment (existing Parse webhook flow)
+- When client opens checkout for the remaining, they see the current `balanceDue` and pay normally
+- No "auto-generate remaining balance milestone" logic
+- No vault-aware balance tracking in the schedule system
+
+**Can the merchant add new milestones after all scheduled ones complete?**
+- Yes — the vault has transitioned to an effectively dormant state (no ACTIVE row, no schedules)
+- To auto-pay new milestones, client would need to re-vault (new consent for new amounts/dates)
+- More likely: merchant sends a checkout link for the remaining and client pays manually
+
+**Implementation:**
+- Overpayment check lives in checkout (is-unifiedxp) at the point where the auto-pay opt-in is rendered
+- Simple comparison: `sumMilestoneAmounts > invoiceTotal` → hide/disable opt-in
+- No is-payments or is-stripe involvement — this is a pure UI/checkout gate
+
 ### Negative balance / overpayment (pre-existing, not auto-pay specific)
 
 The system intentionally allows negative balances (Parse backend comments: "can be negative if the customer overpaid"). Form validation is inconsistent: upcoming payment forms cap at invoice total, but "Mark as Paid" and "Record Payment" forms have no max. This is a pre-existing gap unrelated to auto-pay.

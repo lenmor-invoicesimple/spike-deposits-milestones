@@ -1,0 +1,62 @@
+---
+title: "AFTER — With Automatic Payment Requests (APR)"
+---
+flowchart TB
+    subgraph Merchant["Merchant Action"]
+        M1[Sends Invoice Email]
+        M2[Client views checkout]
+        M3["Creates milestones<br/>(Invoice.dueDate synced)"]
+    end
+
+    subgraph IsApi["is-api (legacy)"]
+        A1[insertMsg to PostgreSQL]
+        A2[createParseMsg in MongoDB]
+        A3[Queue email via @is/messaging]
+    end
+
+    subgraph IsMessages["is-messages"]
+        B1[Email delivered to client via Mailgun]
+        B2["Cron: every 30 min<br/>'Unopened Invoice' reminder<br/>(2-4 days, unchanged)"]
+    end
+
+    subgraph AbandonedCart["is-abandoned-cart (is-services)"]
+        C1["EventBridge schedules<br/>'Complete Payment' reminder<br/>(30min + 3 days, unchanged)"]
+    end
+
+    subgraph APR["NEW: Automatic Payment Requests (is-services)"]
+        direction TB
+        E1["EventBridge Rule: daily cron (14:00 UTC)"]
+        E2["MongoDB direct: Invoice.find<br/>dueDate = today, balanceDue > 0<br/>paymentRequestSentDate ≠ today"]
+        E3["MongoDB direct: Setting.find<br/>AutomaticPaymentRequests = true<br/>account IN [accountIds]"]
+        E4["In-memory join:<br/>filter to enabled accounts"]
+        E5["queueSWUJob() via @is/messaging<br/>→ HTTP POST to is-messages<br/>→ SQS → Mailgun"]
+        E6["Parse.Cloud.run<br/>createInvoiceHistoryEntry<br/>eventType: payment_request_sent"]
+        E7["Set Invoice.paymentRequestSentDate = today"]
+
+        E1 --> E2 --> E3 --> E4 --> E5
+        E5 --> E6
+        E5 --> E7
+    end
+
+    subgraph Client["Client"]
+        D1["Receives invoice email"]
+        D2["Gets 'Unopened invoice' (if not opened)"]
+        D3["Gets 'Complete Payment' (if checkout viewed)"]
+        D4["Gets 'Payment Due Today' ← NEW<br/>CTA: Complete Payment → checkout URL"]
+    end
+
+    M1 --> A1 --> A3 --> B1 --> D1
+    M1 --> A2
+    M3 -.->|"recalculateInvoiceDueDate()"| E2
+
+    B2 --> D2
+    C1 --> D3
+    E5 --> D4
+
+    M2 --> C1
+
+    style APR fill:#d5f5e3,stroke:#27ae60,stroke-width:2px
+    style E1 fill:#abebc6,stroke:#27ae60
+    style D4 fill:#d5f5e3,stroke:#27ae60
+    style E5 fill:#abebc6,stroke:#27ae60
+    style E6 fill:#abebc6,stroke:#27ae60

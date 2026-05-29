@@ -179,7 +179,13 @@ The server always overwrites `Invoice.dueDate` and `setting.termsDay` — the UI
 
 ### Client-Side Guards (`invoice-info.screen.tsx`)
 
-All guards use the same condition: **`hasUnpaidMilestones`** (check if Payment collection has records with `doesNotExist('date')` for this invoice).
+All guards use the same condition: **`hasUnpaidMilestones`** — derived from Realm using `getUpcomingPayments(invoice.remoteId).length > 0`.
+
+**How `hasUnpaidMilestones` is passed:**
+- **Call site:** `invoice.screen.tsx` → `onPressInvoiceInfo()` computes the flag via `getUpcomingPayments(invoice.remoteId).length > 0` and passes it as a nav param
+- **Function:** `getUpcomingPayments` (`services/realm/entities/payments/repository.ts:32`) queries Realm for `date == nil && deleted == false` — same semantics as the server query
+- **Synchronous:** Realm queries are sync, no async needed at the call site
+- **Why not `termsDay === CUSTOM`:** CUSTOM can be set manually by the merchant (custom due date without milestones). Using the actual Payments data is the only accurate signal.
 
 | Line | User action | Guard |
 |------|-------------|-------|
@@ -222,6 +228,8 @@ export const getDueDate = (date: string, terms: number): string | undefined => {
 
 All guards are on **one screen** (`invoice-info.screen.tsx`). Locking Terms + DueDate fields handles lines 229/264/281. The only code guard is on line 188 (Date change).
 
+**Verified (2026-05-28):** All `getDueDate()` call sites on mobile audited — the 3 in `invoice-info.screen.tsx` are guarded, and the 2 in `repository.ts:420` and `models.ts:206` are invoice-creation paths where milestones can't exist. No gaps.
+
 ### Mobile (`is-mobile`)
 - [ ] Lock dueDate field in invoice details when milestones exist
 - [ ] Lock Terms field in invoice details when milestones exist
@@ -236,6 +244,18 @@ All guards are on **one screen** (`invoice-info.screen.tsx`). Locking Terms + Du
 - [ ] Warning modal on milestone creation (same conditions as mobile)
 - [ ] Show shortcut link → navigates to payment scheduling section when dueDate is auto-derived
 - [ ] Toast/snackbar on Payment Scheduling when a saved milestone becomes the invoice dueDate
+
+**Web re-derivation audit (2026-05-28):**
+
+All re-derivation paths are in `InvoiceModel.ts` and `InvoiceTerms.tsx`:
+
+| Method | File:Line | Guard needed? | Notes |
+|--------|-----------|---------------|-------|
+| `setInvoiceDate()` | `InvoiceModel.ts:525` | **No — already safe** | Condition is `termsDay > 0`; server sets `termsDay = CUSTOM (-1)` when milestones exist, so re-derivation never fires |
+| `setTerms()` | `InvoiceModel.ts:536` | **Yes** — disable Terms `<Select>` | Called from `InvoiceTerms.tsx:116` |
+| `setDueDate()` | `InvoiceModel.ts:559` | **Yes** — disable DueDate `<DatePickerWrapper>` | Called from `InvoiceTerms.tsx:140` |
+
+Simpler than mobile — `setInvoiceDate` is already safe. Only need `isDisabled={hasUnpaidMilestones}` on the two inputs in `InvoiceTerms.tsx`.
 
 ---
 
@@ -443,3 +463,26 @@ Upcoming payment execution Lambda
 **Known TS error in `recalculateInvoiceDueDate.ts`:** `Argument of type 'typeof Payment' is not assignable to parameter of type 'string | (new (...args: any[]) => Object<Attributes>)'` and `.get()`/`.set()` not found on `parse.Invoice`. To fix: check how `updatePaymentDetails.ts` uses parse types and mirror that pattern (e.g., it may use `Parse.Object` directly instead of the typed wrappers).
 
 **Updated code needed:** The current implementation only sets `dueDate`. It needs to be updated to also set `termsDay` (as shown in the updated code snippet in this doc). The `else` branch also needs to clear `dueDate` and reset `termsDay = DUE_ON_RECEIPT`.
+
+---
+
+## Feature Summary (2026-05-28)
+
+**Current:** Invoice terms (`dueDate` and `setting.termsDay`) are set by the merchant directly via the Terms picker or custom date on mobile/web; milestones have their own `dueDate` field with no connection to the invoice-level terms.
+
+**Proposed:** Invoice terms are automatically derived from the soonest unpaid milestone — `dueDate` reflects that milestone and `termsDay` is locked to `CUSTOM (-1)`; when all milestones are paid/deleted, terms reset to `DUE_ON_RECEIPT (0)` and the UI unlocks.
+
+**Details:**
+- New shared helper `recalculateInvoiceDueDate.ts` queries Payment collection for soonest unpaid milestone (`doesNotExist('date')`, `exists('dueDate')`, `equalTo('deleted', false)`)
+- Sets `Invoice.dueDate` to that milestone's dueDate + `setting.termsDay = CUSTOM (-1)` to prevent client re-derivation
+- When no unpaid milestones remain, clears `dueDate = null` and resets `setting.termsDay = DUE_ON_RECEIPT (0)`
+- Called from 3 hook points: 1A (add milestone), 1B (edit/delete milestone), 1C (mark paid)
+- Mobile/web UI locks Terms + DueDate fields when milestones exist, using `getUpcomingPayments(invoice.remoteId).length > 0` as the signal (not `termsDay === CUSTOM`, since CUSTOM can be set manually by the merchant)
+- Auto-pay execution handler (is-payments, not yet built) **must** use `invoiceUpdatePayment` with `markPaid: true` to correctly advance the terms
+
+**Confirm:**
+- [ ] **PM:** Warning modal shows even for inherited terms (not explicitly set on this invoice) — Seth/Liz confirmed May 27, re-confirm if UX team raises concerns
+- [ ] **Engineering (is-payments):** Auto-pay handler requirement is documented but not enforced — add integration test or code comment?
+- [ ] **Risk — race condition:** Concurrent invoice save from mobile while a milestone is being edited — last-writer-wins on `dueDate`/`termsDay`. Low probability.
+- [ ] **Risk — deposits:** Excluded by `q.exists('dueDate')` since deposits have `dueDate: null`. If deposits ever gain a dueDate, consider adding `q.notEqualTo('paymentType', 'deposit')` guard.
+- [ ] **Unknown:** "All milestones deleted → DUE_ON_RECEIPT" loses the merchant's original terms (e.g., Net 30). Is this intentional? (Likely yes — milestones represent a deliberate workflow change.)
