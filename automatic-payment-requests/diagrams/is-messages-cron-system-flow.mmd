@@ -1,0 +1,33 @@
+---
+title: "is-messages Cron — System Flow"
+---
+graph LR
+    %% Trigger
+    EB[EventBridge<br/>every 30 min]
+
+    %% Lambda
+    L1[Lambda<br/>reminderHandler]
+
+    %% Data stores
+    PG[(PostgreSQL<br/>msg table)]
+    PARSE[(Parse<br/>publicInvoice<br/>validate due date + terms)]
+
+    %% Email
+    SQS[[SQS]]
+    MAILGUN[Mailgun<br/>send email]
+
+    %% Flow
+    EB -->|triggers| L1
+    L1 -->|"SELECT unsent msgs<br/>2-4 day old, LIMIT 1000"| PG
+    L1 -->|"validate each msg<br/>(due date, terms)"| PARSE
+    L1 -->|queue email| SQS
+    SQS --> MAILGUN
+    L1 -->|"UPDATE<br/>reminder_sent_dt = now()"| PG
+
+    %% Styling
+    style EB fill:#fff3e0,stroke:#f57c00
+    style L1 fill:#f9f3e3,stroke:#d4a017
+    style PG fill:#e3f2fd,stroke:#1565c0
+    style PARSE fill:#e8f5e9,stroke:#388e3c
+    style SQS fill:#fce4ec,stroke:#c62828
+    style MAILGUN fill:#f3e5f5,stroke:#7b1fa2

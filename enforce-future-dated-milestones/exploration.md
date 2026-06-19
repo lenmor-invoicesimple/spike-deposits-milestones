@@ -40,6 +40,12 @@ A milestone is by definition a future scheduled payment after the deposit. There
 - UI date picker on both platforms — disable or block invalid dates via `minDate` prop
 - No server-side enforcement needed pre-vault (UI guard is sufficient)
 
+**Feature Flag:**
+- Gated behind a client-side Optimizely FF (per Liz: all Phase 1/2 features must be gated)
+- When FF is off: current behavior (no date restriction)
+- When FF is on: past/today dates blocked
+- **Do NOT add any FF on is-parse-server**
+
 ### Implementation Complexity: Low
 
 Both platforms already have the date-range plumbing — it's just not wired up for milestones.
@@ -60,6 +66,19 @@ Both platforms already have the date-range plumbing — it's just not wired up f
 **Slightly tricky part:** Computing `minDate` for rule 3 (deposit's `dueDate`) requires reading the deposit from form context. But the deposit is already loaded in both forms, so it's accessible.
 
 **Open question:** Needs discussion with Seth on UX — block the date in the picker (recommended, simpler), or show an error on save?
+
+### Backbook / Existing Milestones Edge Case
+
+Milestones created before this feature was shipped may already have past dates. When a user opens one of these for editing:
+
+- Setting `minimumDate` on the picker alone is **not sufficient** — both mobile and web pickers will show the past date greyed out visually but retain it in form state, meaning the user can hit Save and bypass the guard silently
+- A form-level validator (Yup on mobile, form validation on web) must also be added to reject past dates on submit
+
+**Recommended UX (needs Seth confirmation):**
+- Load the form with the existing past date as-is
+- Show an inline validation error immediately: *"Due date must be in the future"*
+- Block Save until the user updates the date
+- Do NOT silently auto-correct the date on load (avoids surprising the user with a changed value)
 
 ### Deposit ↔ Invoice terms relationship
 

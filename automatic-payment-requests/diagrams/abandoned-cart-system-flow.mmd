@@ -1,0 +1,58 @@
+---
+title: "Abandoned Cart — System Flow"
+---
+graph LR
+    %% Triggers
+    CLIENT((Client<br/>views checkout))
+    PAY((Client<br/>pays))
+
+    %% Lambdas
+    L1[Lambda 1<br/>Schedule Reminder]
+    L2[Lambda 2<br/>Send Reminder]
+    L3[Lambda 3<br/>Remove Schedulers]
+
+    %% Data stores
+    DYNAMO[(DynamoDB<br/>schedule state)]
+    SCHED[[EventBridge<br/>Schedulers<br/>30min + 3 days]]
+
+    %% External reads
+    PARSE[(Parse<br/>publicInvoice<br/>invoiceGetPayments)]
+    SETTING[(MongoDB<br/>Setting<br/>via @is/account)]
+
+    %% Email
+    EMAIL[is-messages<br/>→ Mailgun]
+
+    %% Events
+    EV1[EventBridge event<br/>'checkout-viewed']
+    EV2[EventBridge event<br/>'payment-attempted']
+
+    %% Flow - schedule
+    CLIENT -->|triggers| EV1
+    EV1 --> L1
+    L1 -->|check exists| DYNAMO
+    L1 -->|create 2 schedulers| SCHED
+
+    %% Flow - send
+    SCHED -->|fires at scheduled time| L2
+    L2 -->|fetch invoice + payments| PARSE
+    L2 -->|opt-out check| SETTING
+    L2 -->|"send email<br/>(queueSWUJob)"| EMAIL
+
+    %% Flow - cancel
+    PAY -->|triggers| EV2
+    EV2 --> L3
+    L3 -->|delete both rules| DYNAMO
+
+    %% Styling
+    style CLIENT fill:#fff9c4,stroke:#f9a825
+    style PAY fill:#fff9c4,stroke:#f9a825
+    style L1 fill:#e3f2fd,stroke:#1565c0
+    style L2 fill:#e3f2fd,stroke:#1565c0
+    style L3 fill:#e3f2fd,stroke:#1565c0
+    style SCHED fill:#fff3e0,stroke:#f57c00
+    style DYNAMO fill:#fce4ec,stroke:#c62828
+    style PARSE fill:#e8f5e9,stroke:#388e3c
+    style SETTING fill:#e8f5e9,stroke:#388e3c
+    style EMAIL fill:#f3e5f5,stroke:#7b1fa2
+    style EV1 fill:#fff3e0,stroke:#f57c00
+    style EV2 fill:#fff3e0,stroke:#f57c00

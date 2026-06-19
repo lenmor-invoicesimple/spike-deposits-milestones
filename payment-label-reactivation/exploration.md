@@ -16,7 +16,8 @@ This doc evaluates what it takes to make it editable.
 |---|---|---|
 | Web (upcoming) | `is-web-app/nextjs/components/invoice-editor/invoice-payment/payment-scheduling/upcoming-payment-form-modal.tsx:193` | `disabled={true}` |
 | Web (completed/record) | `is-web-app/nextjs/components/invoice-editor/invoice-payment/payment-scheduling/completed-payment-form-modal.tsx:247` | `disabled={true}` |
-| Mobile | `is-mobile/src/features/documents/screens/manage-payment.screen.tsx:401` | `editable={false}` |
+| Mobile (upcoming/deposit) | `is-mobile/src/features/documents/screens/manage-payment.screen.tsx:401` | `editable={false}` |
+| Mobile (historical) | `is-mobile/src/features/documents/screens/manage-historical-payment.screen.tsx` | **Field does not exist** — needs to be added |
 
 ### How label is auto-assigned today
 
@@ -90,11 +91,44 @@ Hardcodes `PaymentLabel.DEPOSIT` when creating a new deposit via the legacy Invo
 | 5 | `manage-payment.screen.tsx:401` | Remove `editable={false}` |
 | 6 | Mobile validation schema | Ensure label is optional (already `string().trim().required()` — may want to relax to optional with default) |
 
-### Optional enhancements
+### Rendering surfaces to verify
 
-- Add max length validation (e.g. 30 chars) to prevent UI overflow
-- Keep the auto-generated default ("Deposit"/"Payment") as placeholder text so users know what it defaults to
-- Consider whether label should remain editable after mark-as-paid (or lock once completed)
+Custom labels must display properly on all surfaces where "Deposit"/"Payment" currently renders:
+
+| Surface | Where | Concern |
+|---|---|---|
+| Public invoice (`/v/` route) | "UPCOMING PAYMENTS" section — label is rendered inline left-aligned with amount right-aligned | Long labels could overlap or wrap awkwardly |
+| PDF export | Same "UPCOMING PAYMENTS" section in generated PDF | Fixed-width layout — long strings may overflow or get truncated |
+| Mobile Payment Scheduling screen | Payment row label text | Already renders `label` as plain text — should handle custom values |
+| Web Payment Scheduling tab | Payment row in upcoming/completed lists | Same as mobile |
+| Email template (if applicable) | Check if payment breakdown appears in any transactional emails | TBD — verify during implementation |
+
+### Validation
+
+- Max length: **30 characters** (recommended default — prevents overflow on PDF/mobile row). Mark for discussion during grooming.
+- Allowed characters: alphanumeric + common punctuation (no special/control characters)
+- Empty/whitespace-only: fall back to auto-generated default ("Deposit"/"Payment")
+- Server-side: add validation in `invoiceValidation.ts`
+- Client-side: add `maxLength` attribute on web input, character limit on mobile input
+
+---
+
+## Open Questions
+
+### Engineering concerns
+
+- [ ] Verify label rendering on public invoice (`/v/` route) with long strings (e.g. 30 chars) — does it wrap, truncate, or overflow?
+- [ ] Verify PDF rendering with long labels — same check for the "UPCOMING PAYMENTS" section
+- [ ] Check if any email templates (checkout confirmation, payment receipt) include the payment label
+- [ ] Confirm `invoiceValidation.ts` is the right place for server-side validation (vs inline in `updatePayment.ts`)
+
+### Product/Design concerns (discuss during grooming)
+
+- [ ] Max character limit — is 30 chars the right cap? Should we allow more on web but truncate on mobile/PDF?
+- [ ] Should label remain editable after a payment is marked as paid, or lock once completed?
+- [ ] Should the default "Deposit"/"Payment" be a placeholder hint or a pre-filled value?
+- [ ] Does the unlocked field need a design review for styling, or is current field appearance acceptable?
+- [ ] Any analytics event needed when a user customizes the label? (e.g. track adoption)
 
 ---
 
@@ -134,14 +168,11 @@ is-parse-server
 - Add fallback in `invoiceHooks.ts:334,369,430` so legacy sync path doesn't clobber custom labels
 - `invoiceAddPayment.ts` already falls back correctly — no change needed
 
+Rendering verification
+- Public invoice (`/v/` route): "UPCOMING PAYMENTS" section — currently shows "Deposit" / "Payment" hardcoded; must handle custom labels up to 30 chars
+- PDF export: same section — verify long labels don't overflow fixed-width layout
+- Email templates: check if payment label appears in any transactional emails
+
 No change needed
 - Calculator (`@invoice-simple/calculator`) — label-agnostic, uses `paymentType` enum for all logic
 - Mobile display — renders label as plain text, no branching on value
-
-**Confirm:**
-- Should there be a max character limit on label? (UI overflow risk on mobile/PDF)
-- Should label remain editable after a payment is marked as paid, or lock once completed?
-- Should the default "Deposit"/"Payment" be a placeholder hint or a pre-filled value?
-- Does this need design review for the unlocked field styling, or is current field appearance acceptable?
-- Any analytics event needed when a user customizes the label?
-- Does the PDF/email template render `label` — if so, does it handle long strings gracefully?

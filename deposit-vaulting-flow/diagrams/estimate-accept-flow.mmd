@@ -1,0 +1,49 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#e8f4fd', 'primaryBorderColor': '#2196F3', 'secondaryColor': '#fff3e0', 'secondaryBorderColor': '#FF9800', 'tertiaryColor': '#e8f5e9', 'tertiaryBorderColor': '#4CAF50'}}}%%
+
+flowchart LR
+    subgraph CLIENT ["📱 Mobile / Web (merchant)"]
+        C_SEND["Merchant hits<br/>Send Estimate<br/>with deposit"]
+    end
+
+    subgraph API_MSG ["🔵 API + is-messages (EXISTING)"]
+        API["Send flow"]
+        MSG["is-messages:<br/>compose + send email<br/>with /v/{docId}/approve link"]
+    end
+
+    subgraph WEB_APP ["🟢 is-web-app (EXISTING — new route)"]
+        V1["<b>GET /v/{docId}/approve</b><br/>Fetch estimate<br/>If approvedAt → show invoice<br/>Else → render estimate +<br/>Approve button"]
+    end
+
+    subgraph PARSE ["🆕 Parse Cloud Function"]
+        A1["<b>approveEstimate()</b><br/>Check approvedAt (atomic)<br/>Convert estimate → invoice<br/>Set approvedAt + approvedBy<br/>Save invoice<br/>Push notify merchant<br/>Return { invoiceId }"]
+    end
+
+    subgraph END_CLIENT ["👤 End Client"]
+        EC["Email received<br/>Review Estimate CTA<br/>+ deposit amount"]
+    end
+
+    subgraph CHECKOUT ["✅ is-unifiedxp + is-checkout (EXISTING)"]
+        CH["/checkout/{invoiceId}<br/>Deposit + fee → Pay<br/>Save Payment Method<br/>Success → fullyPaid (→ Closed)"]
+    end
+
+    subgraph MERCHANT ["📱 Merchant Device (sync trigger)"]
+        M1["Silent sync push<br/>Invoice appears<br/>Estimate → Approved<br/>ALERT: 'Estimate approved!'"]
+    end
+
+    C_SEND --> API
+    API --> MSG
+    MSG --> EC
+    EC -->|"clicks Review Estimate"| V1
+    V1 -->|"clicks Approve"| A1
+    A1 -->|"redirect"| CH
+    A1 -->|"push"| M1
+
+    classDef newService fill:#fff3e0,stroke:#FF9800,stroke-width:2px
+    classDef existing fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px
+    classDef email fill:#e8f4fd,stroke:#2196F3,stroke-width:2px
+    classDef client fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
+
+    class A1 newService
+    class V1,CH,API,MSG existing
+    class EC email
+    class C_SEND,M1 client

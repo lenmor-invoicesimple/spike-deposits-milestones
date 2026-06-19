@@ -32,10 +32,42 @@ Always overwrite on every milestone change. `Invoice.dueDate` is locked in the U
 Shared helper called from all 3 hook points. Queries the Payment collection directly (not `Invoice.payments[]` — that only contains paid payments) for the soonest unpaid milestone.
 
 ```typescript
-// Queries Payment collection for unpaid milestones (no date = not yet paid)
-// Sets Invoice.dueDate to the soonest one's dueDate + termsDay to CUSTOM
-// If no unpaid milestones remain → resets termsDay to DUE_ON_RECEIPT, clears dueDate
-export const recalculateInvoiceDueDate = async (invoice: parse.Invoice): Promise<void>
+export const recalculateInvoiceDueDate = async (
+  invoice: parse.Invoice,
+  { resetOnEmpty = true }: { resetOnEmpty?: boolean } = {},
+): Promise<void> => {
+  const q = new Parse.Query(parse.Payment);
+  q.equalTo('invoiceRemoteId', invoice.get('remoteId'));
+  q.equalTo('deleted', false);
+  q.doesNotExist('date'); // no completion date = still unpaid/scheduled
+  q.exists('dueDate');
+  q.ascending('dueDate');
+  q.limit(1);
+
+  const [soonestMilestone] = await q.find({ useMasterKey: true });
+  const setting = invoice.get('setting');
+
+  if (soonestMilestone) {
+    const dueDate = soonestMilestone.get('dueDate');
+    invoice.set('dueDate', format(new Date(dueDate), 'yyyy-MM-dd'));
+    setting.termsDay = InvoiceTermTypes.CUSTOM;
+  } else if (resetOnEmpty) {
+    // Check if milestones ever existed on this invoice (including deleted/paid ones)
+    const historyQ = new Parse.Query(parse.Payment);
+    historyQ.equalTo('invoiceRemoteId', invoice.get('remoteId'));
+    historyQ.exists('dueDate');
+    historyQ.limit(1);
+    const hadMilestones = (await historyQ.count({ useMasterKey: true })) > 0;
+
+    if (hadMilestones) {
+      // All milestones deleted — reset to clean slate, unlock UI
+      invoice.set('dueDate', null);
+      setting.termsDay = InvoiceTermTypes.DUE_ON_RECEIPT;
+    }
+  }
+
+  invoice.set('setting', setting);
+};
 ```
 
 **What it sets:**
@@ -45,18 +77,18 @@ export const recalculateInvoiceDueDate = async (invoice: parse.Invoice): Promise
 | Unpaid milestone exists | Soonest milestone's dueDate | `-1` (CUSTOM) |
 | No unpaid milestones (all paid/deleted) | `null` (cleared) | `0` (DUE_ON_RECEIPT) |
 
+**`resetOnEmpty` parameter:**
+- `true` (default — used by 1A/1B): when no unpaid milestones remain, resets to DUE_ON_RECEIPT and clears dueDate. Used on add/edit/delete paths where "nothing left" means milestones were removed.
+- `false` (used by 1C): skips the reset entirely when all milestones are paid. All milestones paid = invoice complete; preserve original termsDay so the next invoice inherits the merchant's preferred terms. Only fires the history check + reset when `resetOnEmpty: true`.
+
+**`hadMilestones` history check (inside `resetOnEmpty` branch):**
+The `else if (resetOnEmpty)` branch doesn't unconditionally reset — it first checks whether any Payment with `exists('dueDate')` ever existed on this invoice (including deleted/paid ones). Without this guard, a plain invoice with no milestones would get reset to DUE_ON_RECEIPT on every `invoiceAddPayment` call for a non-milestone payment (e.g., a regular payment without a dueDate). The history query is a `count` with `limit(1)` — fast, index-friendly.
+
 **Why `termsDay` must change too:**
 - Mobile sends both `dueDate` and `setting.termsDay` on every invoice save
 - If `termsDay` stays as `30` (Net 30), the client's `getDueDate()` could re-derive `dueDate = invoiceDate + 30` on the next save, overwriting the milestone-derived value
 - Setting `termsDay = -1` (CUSTOM) means: "dueDate is set directly, don't compute from formula"
 - Setting `termsDay = 0` (DUE_ON_RECEIPT) on "all milestones deleted" means: clean slate, no dueDate
-
-**How to set `termsDay` (existing pattern in `invoiceHooks.ts`):**
-```typescript
-const setting = invoice.get('setting');
-setting.termsDay = InvoiceTermTypes.CUSTOM; // or DUE_ON_RECEIPT
-invoice.set('setting', setting);
-```
 
 **Why Payment collection and not `Invoice.payments[]`:**
 - `Invoice.payments[]` only contains **paid** payments
@@ -235,14 +267,34 @@ All guards are on **one screen** (`invoice-info.screen.tsx`). Locking Terms + Du
 - [ ] Lock Terms field in invoice details when milestones exist
 - [ ] Skip `getDueDate()` re-derivation on invoice Date change when milestones exist
 - [ ] Warning modal on back button from milestone creation (conditions above)
-- [ ] Show shortcut link on Invoice Details → navigates to Payment Scheduling when dueDate is auto-derived
+- [ ] Show info banner on Invoice Details → navigates to Payment Scheduling when dueDate is milestone-derived (see below)
 - [ ] Toast on Payment Scheduling page (~3s) when a saved milestone becomes the invoice dueDate (first milestone, or sooner than all others)
+
+#### Info Banner on Invoice Details (mobile)
+
+**What:** Green success banner below Due Date row: "Due date updated to match your soonest payment date" with chevron → navigates to Payment Scheduling screen.
+
+**Complexity: Low (~1-2 hours)**
+
+Existing building blocks:
+- `<Banner variant="success">` component (`src/ui/banner/banner.tsx`) — supports `leftIcon`, `rightIcon`, colored background
+- `check-circle` icon pattern already used elsewhere (green `#22C55E`)
+- `NavigationRow` component with built-in chevron support (`src/ui/views/section.tsx:222`)
+- Route `PaymentSchedulingScreen` already wired in `invoices.navigator.tsx:229`
+- `hasUnpaidMilestones` flag already available on the screen (controls lock state)
+
+**Implementation:**
+1. Add banner conditionally after `renderInvoiceDueDate()` when `hasUnpaidMilestones === true`
+2. On press → `navigation.navigate('PaymentSchedulingScreen', { invoice, onSubmit: this.onChangePayments })`
+3. Deep-link to specific milestone (optional, Phase 2) — pass `scrollToMilestoneId` param, use `scrollToIndex` on list
+
+**File:** `is-mobile/src/features/documents/screens/invoice-info.screen.tsx`
 
 ### Web (`is-web-app`)
 - [ ] Disable dueDate/Terms inputs in invoice editor when milestones exist
 - [ ] Skip dueDate re-derivation on invoice date change when milestones exist
 - [ ] Warning modal on milestone creation (same conditions as mobile)
-- [ ] Show shortcut link → navigates to payment scheduling section when dueDate is auto-derived
+- [ ] Show info banner → navigates to payment scheduling section when dueDate is milestone-derived (same pattern as mobile)
 - [ ] Toast/snackbar on Payment Scheduling when a saved milestone becomes the invoice dueDate
 
 **Web re-derivation audit (2026-05-28):**
@@ -273,6 +325,349 @@ Simpler than mobile — `setInvoiceDate` is already safe. Only need `isDisabled=
 | Single milestone deleted | Re-derives from remaining | `-1` (CUSTOM) | Locked |
 | Deposit milestone | Excluded (has `dueDate: null`) | — | — |
 | Merchant changes invoice Date while milestones exist | No change (guard skips re-derivation) | No change | Date editable, dueDate locked |
+| **Old client changes termsDay or invoiceDate** | Server guard corrects (see below) | Server guard corrects | Old UI has no lock |
+
+---
+
+## Backwards Compatibility: Server Guard in `beforeSaveInvoice`
+
+**Problem:** Old mobile/web clients (deployed before the UI lock changes) can still:
+1. Change `invoiceDate` → old client calls `getDueDate(newDate, CUSTOM)` → returns `null` → overwrites milestone-synced dueDate
+2. Change `termsDay` → old client picks e.g. `DAYS_7` → re-derives `dueDate = invoiceDate + 7` → overwrites milestone-synced dueDate and termsDay
+
+**Why this doesn't bounce:** Mobile only re-derives dueDate when user explicitly changes termsDay or invoiceDate (confirmed via audit of `invoice-info.screen.tsx`). On normal saves, it passes through whatever dueDate is in local state. So the server-corrected value persists locally until the user actively touches those fields.
+
+**Fix:** Add a guard in `beforeSaveInvoice` (`invoiceHooks.ts`) — checks the *original* (pre-save) `termsDay`. If it was CUSTOM (meaning milestones own this invoice), re-run `recalculateInvoiceDueDate()` to overwrite whatever the client sent.
+
+```typescript
+// Backwards-compat guard: old clients (without the UI lock for terms/dueDate fields)
+// can overwrite the milestone-synced dueDate when the user changes invoiceDate or termsDay.
+// If unpaid milestones exist, re-run recalculate to ensure server always wins.
+// Safe: no bounce because mobile only re-derives dueDate on explicit user interaction,
+// not on every save — the corrected value persists locally until the next explicit change.
+// Can be removed once old client versions are fully phased out (force-update threshold).
+// Uses req?.original (pre-save snapshot) to check if termsDay WAS CUSTOM before this save —
+// catches the case where an old client overwrites CUSTOM with a day-based value.
+const originalTermsDay = req?.original?.get('setting')?.termsDay;
+if (originalTermsDay === InvoiceTermTypes.CUSTOM) {
+  await recalculateInvoiceDueDate(invoice);
+}
+```
+
+**Why `req?.original` instead of current value:** If an old client overwrites `termsDay` from `CUSTOM` → `DAYS_7`, checking the *current* value would see `DAYS_7` and skip the guard. Checking the *original* catches exactly this case.
+
+**Performance:** Only fires for invoices where `termsDay` was already CUSTOM (milestones exist). Non-milestone invoices skip entirely — zero extra queries.
+
+**PR:** Committed to [is-parse-server#594](https://github.com/invoice-simple/is-parse-server/pull/594) (`spike-tie-milestone-changes-to-invoice-due-date` branch).
+
+### Why a feature flag doesn't replace this
+
+A feature flag could gate the **new UI lock** (roll out gradually to new clients), but it **doesn't protect against old clients** — they don't know about the flag and will keep sending stale dueDate/termsDay regardless.
+
+The server guard is needed for the window where:
+- Server has `recalculateInvoiceDueDate` deployed
+- Old clients haven't updated yet (no UI lock, no flag check)
+
+**Feature flag is optional on top** for gradual rollout of the new client UI lock. Server guard is the safety net regardless.
+
+### Removal criteria
+
+This guard can be removed once old client versions are fully phased out (force-update threshold). Document heavily on the PR branch.
+
+---
+
+## Musashi's Suggestion: Piggyback on `updatePaymentDetailsWithPayments`
+
+**Context:** Musashi asked (Confluence comment Jun 3): "why don't we update dueDate the way paidAmount, balanceDue is updated? That way, no extra call or save is happening" — referencing `updatePaymentDetailsWithPayments` in `cloud/collections/invoice/utils/updatePaymentDetails.ts`.
+
+### What `updatePaymentDetailsWithPayments` does
+
+```typescript
+// updatePaymentDetails.ts (private function, not exported directly)
+const updatePaymentDetailsWithPayments = async ({ invoice }: { invoice: parse.Invoice }) => {
+  const payments = await getPayments({ params: { invoiceId: invoice.id, sortOrder: 'desc', sortField: 'date' } });
+  const commonPayments = payments.map(parsePaymentToCommonPayment);
+  const universalInvoice = getUniversalInvoice({ invoice });
+  invoice.set('balanceDue', +getInvoiceBalance(universalInvoice, commonPayments));
+  invoice.set('paidAmount', +getPaidAmount({ payments: commonPayments }));
+};
+```
+
+Two exported wrappers:
+- `updatePaymentDetails(invoice)` — fetches fresh invoice, calls above, then `parse.save()`
+- `updatePaymentDetailsForInvoiceHook(invoice)` — calls above, does NOT save (caller handles it)
+
+### Verification: Same 3 hook points
+
+Both `updatePaymentDetails` and `recalculateInvoiceDueDate` are called at the **exact same 3 locations**, right next to each other. Actual code as implemented:
+
+```typescript
+// 1A: invoiceAddPayment.ts
+const updatedInvoice = await updatePaymentDetails({ invoice });
+await recalculateInvoiceDueDate(updatedInvoice);
+await parse.save(updatedInvoice);
+return { invoice: updatedInvoice, paymentId };
+
+// 1B: updatePayment.ts
+await updatePaymentDetails({ invoice });
+await recalculateInvoiceDueDate(invoice);  // resetOnEmpty: true (default)
+await parse.save(invoice);
+
+// 1C: addPaymentToInvoice.ts
+await updatePaymentDetails({ invoice });
+invoice.set('paidDate', ...); invoice.set('payments', ...); // existing fields
+await recalculateInvoiceDueDate(invoice, { resetOnEmpty: false });
+return parse.save(invoice);
+```
+
+No extra save is happening — `recalculateInvoiceDueDate()` only mutates the in-memory object, same as `updatePaymentDetailsWithPayments`. The `save()` call at the end persists both changes atomically.
+
+### Could we merge them?
+
+**Technically yes**, but with caveats:
+
+1. **1C passes `{ resetOnEmpty: false }`** — merging would require a parameter on the combined function
+2. **Separation of concerns** — "financial summary" (balance, paidAmount) vs "schedule sync" (dueDate) are conceptually different
+3. **The 4th call site** — `recalculateInvoiceDueDate` is also called from `beforeSaveInvoice` (backwards-compat guard, line 91 of `invoiceHooks.ts`). That's NOT a payment operation and shouldn't recalculate balanceDue.
+
+### Verdict
+
+**What we did already satisfies Musashi's concern.** There's no extra save — both functions mutate the same invoice object before a single `save()`. The only difference from literally putting it inside `updatePaymentDetailsWithPayments` is one extra line at each call site. A combined wrapper is possible but cosmetic:
+
+```typescript
+// Possible refactor (optional, no behavior change):
+export const updatePaymentDetailsAndDueDate = async (
+  invoice: parse.Invoice,
+  { resetOnEmpty = true }: { resetOnEmpty?: boolean } = {},
+) => {
+  await updatePaymentDetailsWithPayments({ invoice });
+  await recalculateInvoiceDueDate(invoice, { resetOnEmpty });
+};
+```
+
+**Decision:** Keep as-is for now (explicit at each call site). Can refactor to combined wrapper later if team prefers — no behavior change either way.
+
+---
+
+## Feature Flag Gating
+
+Per Liz: all milestone-sync features must be gated behind a feature flag.
+
+### Constraint: No Optimizely/Flagsmith SDK in is-parse-server
+
+The team confirmed there's no way to add Optimizely SDK to is-parse-server for now. This means the server cannot independently check whether a feature flag is enabled for a given account.
+
+### How clients currently call Parse cloud functions
+
+**No feature flag state is ever passed today:**
+
+| Client | Call pattern | FF context? |
+|--------|-------------|-------------|
+| Mobile | `Parse.Cloud.run('invoiceAddPayment', { invoiceId, payment })` | None — Optimizely/Flagsmith checked client-side only |
+| Web | `Parse.Cloud.run('markPaymentsPaidOrUnpaid', { invoiceRemoteId, ... })` | None — Flagsmith checked client-side only |
+| Checkout webhooks (is-bookkeeping) | `Parse.Cloud.run('invoiceAddPayment', params, { useMasterKey: true })` | None — no user session, no FF context |
+
+### The webhook/auto-pay problem
+
+When a payer completes checkout:
+```
+Stripe webhook → is-bookkeeping → Parse.Cloud.run('invoiceAddPayment', { useMasterKey: true })
+→ afterSave hook fires → recalculateInvoiceDueDate()
+```
+
+There is **no client** in this flow. No one to check Optimizely. Same for future auto-pay (Phase 3). If the recalc is gated by a client-passed flag, these paths would never trigger it.
+
+### Options evaluated
+
+#### Option A: Client passes FF in params
+
+```typescript
+// Mobile/web would send:
+Parse.Cloud.run('invoiceAddPayment', { invoiceId, payment, featureFlags: { milestone_sync: true } })
+
+// Server checks:
+if (params.featureFlags?.milestone_sync) await recalculateInvoiceDueDate(invoice);
+```
+
+| Pro | Con |
+|-----|-----|
+| Per-account gradual rollout | Webhook/auto-pay paths have no client to pass the flag |
+| Client already has Optimizely/Flagsmith | Need fallback for masterKey paths: `if (flag || isMasterKey) recalc()` — but then webhooks always recalc regardless of flag |
+| | Every cloud function signature needs updating |
+
+**Problem:** If webhooks always recalc (because no client to check), then the flag only gates *client-triggered* milestone changes. A merchant could be "off" the flag but still get their dueDate synced when their client pays via checkout. Inconsistent.
+
+#### Option B: ENV kill-switch on Parse + client FF for UI only (RECOMMENDED)
+
+```
+Server: MILESTONE_SYNC_ENABLED=true (ENV in Porter, kill-switch)
+  → recalculateInvoiceDueDate always runs when ENV is on
+  → all triggers (mobile, web, webhook, auto-pay) treated equally
+
+Client: Optimizely/Flagsmith gates UI changes only
+  → Lock fields, show banner, show warning modal
+  → Gradual rollout of UI experience
+```
+
+| Pro | Con |
+|-----|-----|
+| Simple — no cross-layer FF coordination | Server is all-or-nothing (no per-account gradual rollout on server) |
+| Webhook/auto-pay paths work identically | Edge case: merchant sees dueDate change "magically" before UI rolls out to them |
+| Recalc is idempotent and harmless when no milestones exist | |
+| Kill-switch available for emergencies | |
+
+**Why the "magic dueDate" edge case is acceptable:** The recalc only fires when milestones exist AND a milestone is added/edited/deleted/paid. If the merchant isn't interacting with milestones, nothing changes. If they are, the new dueDate is *correct* — they just don't see the explanatory banner yet. Once the UI flag rolls out to them, they get the full experience.
+
+#### Option C: Account-level flag in MongoDB
+
+```typescript
+// New field on Setting collection:
+Setting.find({ accountId, remoteId: 'milestoneSyncEnabled', valBool: true })
+
+// Server hooks check before recalcing:
+const enabled = await isMilestoneSyncEnabled(invoice.get('accountId'));
+if (enabled) await recalculateInvoiceDueDate(invoice);
+```
+
+| Pro | Con |
+|-----|-----|
+| Per-account gradual rollout on server | Requires schema addition + migration |
+| Webhook paths can look it up | Extra query on every payment save (cacheable) |
+| Consistent across all trigger paths | More complex — need to sync this flag with Optimizely/Flagsmith |
+
+#### Option D: Dip's suggestion — new cloud function called by client
+
+```typescript
+// Client calls explicitly when FF is on:
+Parse.Cloud.run('syncMilestoneDueDate', { invoiceId })
+```
+
+| Pro | Con |
+|-----|-----|
+| No changes to existing hooks | Webhook/auto-pay paths STILL need server-side recalc |
+| Client has full FF control | Duplicates logic (client calls + hooks would both need recalc) |
+| | Race condition: client calls recalc, then hook also runs |
+
+### Decision: Option B (ENV kill-switch + client UI flag)
+
+**Server layer:**
+- `recalculateInvoiceDueDate()` gated by ENV: `MILESTONE_SYNC_ENABLED`
+- All trigger paths (mobile, web, webhook, auto-pay) behave the same
+- Kill-switch: set ENV to `false` in Porter → stops all recalculation
+- beforeSave guard also gated by same ENV
+
+**Client layer (gradual rollout):**
+- Optimizely (mobile) / Flagsmith (web) flag: `milestone_due_date_sync`
+- Gates: field locking, info banner, warning modal, skip getDueDate re-derivation
+- Rollout: 0% → 10% → 50% → 100% over days/weeks
+
+**Checkout/webhook layer:**
+- No changes needed — recalc fires from existing hooks, gated by same ENV
+
+### Changes needed per platform
+
+| Platform | What | Lines to change | Effort |
+|----------|------|----------------|--------|
+| **Mobile** | Info banner (locking already works via `hasUnpaidMilestones`) | ~15-20 lines | Low (~2h) |
+| **Web** | Disable Terms + DueDate fields, add banner, wire `hasUnpaidMilestones` prop through component tree | ~30-40 lines | Medium (~4h) |
+| **Checkout/webhooks** | Nothing — doesn't touch dueDate, recalc is in the cloud function | 0 | None |
+| **Parse server** | Add ENV check around recalc calls (3 hook points + beforeSave guard) | ~8 lines | Low (~30min) |
+
+**Mobile detail:** `invoice-info.screen.tsx` already has the lock logic:
+- Line 188-190: skips `getDueDate()` re-derivation when `hasUnpaidMilestones` — already done
+- Line 204-213: DueDate field locked when `hasUnpaidMilestones` — already done
+- Line 247-252: Terms field locked when `hasUnpaidMilestones` — already done
+- Only missing: info banner (~15 lines of JSX)
+
+**Web detail:** `InvoiceTerms.tsx` (lines 107-146):
+- Add `isDisabled={hasUnpaidMilestones}` on Terms `<Select>` and DueDate `<DatePickerWrapper>`
+- Wire `hasUnpaidMilestones` prop from parent (`InvoiceBody.tsx` or store)
+- Add conditional info banner component
+
+### Rollback risk: orphaned state
+
+If ENV is flipped to `false` after being `true`:
+
+1. Invoice already has `termsDay = CUSTOM`, `dueDate = milestone date` (written while enabled)
+2. ENV off → server stops recalculating on milestone edits
+3. Client FF off → UI unlocks Terms/DueDate fields
+4. Merchant edits a milestone → dueDate **doesn't update** (stale)
+5. Merchant changes Terms to Net 30 → client re-derives dueDate from invoiceDate → milestone link silently broken
+
+No crash, no error — just **silent data divergence** between milestones and invoice dueDate. Low blast radius if rollout is incremental.
+
+### Rollback mitigation
+
+If ENV is disabled, run a manual script to fix affected invoices:
+- Query invoices with `setting.termsDay = CUSTOM` that have unpaid milestones
+- Re-run `recalculateInvoiceDueDate()` on each to re-sync, OR reset to `DUE_ON_RECEIPT` if sync is being permanently abandoned
+
+Acceptable for Phase 1 — the "damage" from rollback is a stale dueDate, not money moving incorrectly. Script only needed if we actually roll back.
+
+### Dip's concern: "if we turn off after releasing, dueDate updates would start having a wrong value"
+
+Same as our rollback risk above. Mitigated by the manual script. Also, "wrong value" is really "stale value" — no incorrect money movement, just an out-of-sync dueDate that the merchant can manually fix by editing Terms.
+
+### Dip's concern: "you can do all of this from client side"
+
+**Our counter-argument for server-side:**
+1. **Checkout webhook** — no client exists when payer pays via link; who recalculates?
+2. **Auto-pay (Phase 3)** — is-payments Lambda triggers payment; no client
+3. **Single source of truth** — prevents drift between mobile, web, and webhook paths
+4. **Old clients** — can't update them; server guard catches stale writes regardless
+
+Client-side recalc would work for the happy path but breaks for paths 1-2, which are critical for Phase 3.
+
+### Dip's observation: "To create a new payment you need to be online"
+
+**Confirmed.** This kills the offline edge case entirely. Milestone creation requires network (Parse cloud function call). We can remove offline sync concerns from our risk list. The Realm-to-Parse sync question is about *invoice saves* (which do queue offline), not payment creation.
+
+---
+
+## Realm-to-Parse Sync: Why Server-Owned dueDate Works
+
+Mobile uses a bidirectional, event-driven sync (NOT real-time) between local Realm and Parse Server.
+
+### Sync mechanism
+
+| Direction | How | When triggered |
+|-----------|-----|----------------|
+| Push (Realm → Parse) | `Parse.Object.saveAll()` — sends **full Invoice** including dueDate | On save, after payment ops, user pull-to-refresh |
+| Pull (Parse → Realm) | Queries objects where `updatedAt > lastSyncTime`, rewrites full Realm object | After each push cycle completes |
+| Conflict resolution | Last-writer-wins by `updatedAt` timestamp — server usually wins | Automatic during sync |
+
+No polling, no LiveQuery, no push notifications. Sync is triggered by user actions.
+
+### Happy path for milestone-sync
+
+```
+1. User creates milestone on mobile
+2. Mobile pushes Payment to Parse (cloud function call — requires network)
+3. afterSave hook fires → recalculateInvoiceDueDate() → sets new dueDate on Invoice
+4. Parse updates Invoice.updatedAt
+5. Mobile pull phase: fetches Invoice (updatedAt changed) → overwrites local Realm with server dueDate
+6. UI updates ✓
+```
+
+The push → pull happens in the **same sync cycle**. By the time the next push could occur, local Realm already has the correct server-derived dueDate.
+
+### Why stale dueDate doesn't re-push incorrectly
+
+The concern: "What if mobile pushes its old dueDate back to the server?"
+
+- After step 5, local Realm has the server's dueDate. Next push sends the correct value.
+- Even if timing is off and a stale push arrives, the **beforeSave guard** catches it: if `req.original.termsDay === CUSTOM`, it re-runs `recalculateInvoiceDueDate()` and overwrites whatever the client sent.
+- Double safety: hook recalc + guard recalc both produce the same result (idempotent).
+
+### Key files (mobile sync layer)
+
+| Purpose | File |
+|---------|------|
+| Sync orchestration | `services/sync/utils.ts` — `performSync()`, `syncTable()` |
+| Bidirectional conflict logic | `repository/Syncable.database.ts` — `updatedAt` comparison |
+| Invoice Parse model (push) | `services/parse/models/invoice.ts` — `createParseInvoiceFromInvoice()` |
+| Invoice Realm model (pull) | `services/realm/entities/invoice/models.ts` — `createInvoiceFromParseInvoice()` |
+| Ensure-in-sync before critical ops | `services/sync/ensure-invoice-insync.ts` |
 
 ---
 
@@ -456,13 +851,21 @@ Upcoming payment execution Lambda
 
 ---
 
-## Status & TS Error
+## Status
 
-**Server code status:** Implemented in is-parse-server on branch `spike-tie-milestone-changes-to-invoice-due-date`.
+**Server code status:** Fully implemented in is-parse-server on branch `spike-tie-milestone-changes-to-invoice-due-date`. `yarn build` passes with zero TypeScript errors.
 
-**Known TS error in `recalculateInvoiceDueDate.ts`:** `Argument of type 'typeof Payment' is not assignable to parameter of type 'string | (new (...args: any[]) => Object<Attributes>)'` and `.get()`/`.set()` not found on `parse.Invoice`. To fix: check how `updatePaymentDetails.ts` uses parse types and mirror that pattern (e.g., it may use `Parse.Object` directly instead of the typed wrappers).
+**What's implemented:**
+- [x] `recalculateInvoiceDueDate.ts` — sets both `dueDate` and `setting.termsDay`, `resetOnEmpty` param, `hadMilestones` history guard
+- [x] Hook 1A (`invoiceAddPayment.ts`) — recalc on new milestone
+- [x] Hook 1B (`updatePayment.ts`) — recalc on edit/delete
+- [x] Hook 1C (`addPaymentToInvoice.ts`) — recalc on mark-paid, `resetOnEmpty: false`
+- [x] `beforeSaveInvoice` guard (`invoiceHooks.ts`) — backwards-compat for old clients
 
-**Updated code needed:** The current implementation only sets `dueDate`. It needs to be updated to also set `termsDay` (as shown in the updated code snippet in this doc). The `else` branch also needs to clear `dueDate` and reset `termsDay = DUE_ON_RECEIPT`.
+**Not yet implemented:**
+- [ ] ENV kill-switch (`MILESTONE_SYNC_ENABLED`) — documented in "Feature Flag Gating" above but not yet added to the 4 call sites. Needed before production deploy.
+- [ ] Mobile UI changes (lock fields, info banner, warning modal)
+- [ ] Web UI changes (disable Terms/DueDate inputs, info banner)
 
 ---
 

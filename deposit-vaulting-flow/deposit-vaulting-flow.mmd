@@ -1,0 +1,81 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'primaryColor': '#e8f4fd', 'primaryBorderColor': '#2196F3', 'secondaryColor': '#fff3e0', 'tertiaryColor': '#e8f5e9' } } }%%
+
+flowchart TD
+    %% ===== ITEM 3: VAULTING AT DEPOSIT TIME =====
+    subgraph VAULT["#3 — Vaulting at Deposit Payment"]
+        A[Merchant creates Invoice with Deposit] --> B[Buyer opens checkout link]
+        B --> C["Buyer enters email + optional phone<br/>(verification channels for Path B later)"]
+        C --> D["Buyer pays deposit + PM vaulted<br/>(same as RP — reuse existing infrastructure)"]
+        D --> E2["Store in PG: vaulted_payment_methods<br/>(provider, provider_reference, buyer_email, buyer_phone, invoice_id)"]
+        E2 --> E[Send deposit receipt — Item #2]
+        E --> F{Remaining balance exists?}
+        F -->|No| G[Invoice fully paid ✓]
+        F -->|Yes| FORK
+    end
+
+    %% ===== FORK =====
+    FORK{Two paths to collect remaining balance}
+    FORK -->|Path A| MERCHANT
+    FORK -->|Path B| BUYER
+
+    %% ===== ITEM 4: MERCHANT-INITIATED =====
+    subgraph MERCHANT["#4 — Merchant-Initiated Charge (Path A)"]
+        direction TB
+        M1[Merchant opens Invoice in app] --> M2{Vaulted PM exists<br/>AND balance remaining?}
+        M2 -->|No| M3[Normal invoice view — no button]
+        M2 -->|Yes| M4["Show button: 'Charge AMEX ***123 & Send Receipt'"]
+        M4 --> M5[Merchant taps button]
+        M5 --> M6[Authenticated API call to is-payments]
+        M6 --> M7["Charge vaulted PM<br/>(off_session / billing agreement / etc.)"]
+        M7 --> M8{Charge succeeds?}
+        M8 -->|Yes| M9[Update invoice balance → $0]
+        M9 --> M10[Send receipt to buyer — Item #2]
+        M8 -->|No| M11[Show error to merchant<br/>Card declined / expired]
+        M11 --> M12[Merchant contacts buyer<br/>for new payment method]
+    end
+
+    %% ===== ITEM 5: BUYER-INITIATED =====
+    subgraph BUYER["#5 — Buyer-Initiated Charge (Path B)"]
+        direction TB
+        B1[Buyer clicks checkout link<br/>from invoice email / reminder] --> B2{Vaulted PM exists<br/>for this buyer + invoice?}
+        B2 -->|No| B3[Normal checkout —<br/>buyer enters payment details]
+        B2 -->|Yes| B4[Checkout detects vaulted PM]
+        B4 --> B5[⚠️ VERIFICATION REQUIRED<br/>Cannot show vaulted PM without auth]
+
+        B5 --> B6["Send fresh OTP to buyer<br/>(SMS if phone available, else email)"]
+        B6 --> B7[Buyer enters OTP code]
+        B7 --> B8{Code valid + not expired?}
+        B8 -->|No| B9[Error — retry or resend]
+        B9 --> B6
+        B8 -->|Yes| B10[Session verified ✓]
+
+        B10 --> B11["Show vaulted PM:<br/>'Pay $X with AMEX ***123'"]
+        B11 --> B12[Buyer taps 'Pay Now']
+        B12 --> B13["Charge vaulted PM<br/>(same backend call as Path A)"]
+        B13 --> B14{Charge succeeds?}
+        B14 -->|Yes| B15[Update invoice balance → $0]
+        B15 --> B16[Send receipt to buyer — Item #2]
+        B14 -->|No| B17[Show error — card declined]
+        B17 --> B18[Offer to enter new payment method<br/>or contact merchant]
+    end
+
+    %% ===== SECURITY LAYER DETAIL =====
+    subgraph OTP_DETAIL["Verification Layer (Stripe Link Model)"]
+        direction TB
+        O1[Checkout URL = identifier<br/>Tells us WHICH invoice] --> O2[OTP = verifier<br/>Proves WHO is paying]
+        O2 --> O3{Channel available?}
+        O3 -->|Phone on file| O4["SMS OTP (strongest)<br/>6-digit code, 10-min expiry"]
+        O3 -->|Email only| O5["Email OTP (acceptable)<br/>6-digit code, 15-min expiry"]
+        O4 --> O6[Verify once per session<br/>Buyer stays verified if they refresh]
+        O5 --> O6
+    end
+
+    %% ===== STYLING =====
+    style VAULT fill:#e8f4fd,stroke:#2196F3,stroke-width:2px
+    style MERCHANT fill:#e8f5e9,stroke:#4CAF50,stroke-width:2px
+    style BUYER fill:#fff3e0,stroke:#FF9800,stroke-width:2px
+    style OTP_DETAIL fill:#f3e5f5,stroke:#9C27B0,stroke-width:2px
+    style FORK fill:#ffebee,stroke:#f44336,stroke-width:2px
+    style B5 fill:#ffebee,stroke:#f44336,stroke-width:2px
+    style M4 fill:#c8e6c9,stroke:#4CAF50,stroke-width:2px
+    style B10 fill:#c8e6c9,stroke:#4CAF50,stroke-width:2px

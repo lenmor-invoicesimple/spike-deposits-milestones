@@ -1,0 +1,56 @@
+---
+title: "Email Reminder Flows — is-messages vs abandoned-cart vs APR"
+---
+graph TD
+    %% ═══════════════════════════════════════════
+    %% is-messages cron
+    %% ═══════════════════════════════════════════
+    subgraph IS_MESSAGES["is-messages cron (every 30 min)"]
+        direction TB
+        M1[EventBridge cron<br/>every 30 min] --> M2[Lambda: reminderHandler]
+        M2 --> M3[PostgreSQL: SELECT msg<br/>2-4 day old, unsent, LIMIT 1000]
+        M3 --> M4[For each msg]
+        M4 --> M5["Parse.Cloud.run('publicInvoice')<br/>validate due date & terms"]
+        M5 --> M6[SQS → Mailgun<br/>send email]
+        M6 --> M7[PostgreSQL: UPDATE<br/>reminder_sent_dt = now]
+    end
+
+    %% ═══════════════════════════════════════════
+    %% abandoned-cart
+    %% ═══════════════════════════════════════════
+    subgraph ABANDONED["abandoned-cart (event-driven)"]
+        direction TB
+        A1[Customer views checkout] --> A2["EventBridge: 'checkout-viewed'"]
+        A2 --> A3[Lambda 1: Schedule Reminder]
+        A3 --> A4[DynamoDB: check exists]
+        A4 --> A5[Create 2 EventBridge Schedulers<br/>30 min + 3 days]
+        A5 --> A6[Lambda 2: Send Reminder]
+        A6 --> A7["Parse: publicInvoice +<br/>invoiceGetPayments"]
+        A7 --> A8["@is/account → MongoDB Setting<br/>(opt-out check)"]
+        A8 --> A9[Filter: due date, terms, payable?]
+        A9 --> A10[SWU email via @is/messaging]
+
+        A11[Customer pays] --> A12["EventBridge: 'payment-attempted'"]
+        A12 --> A13[Lambda 3: Remove Schedulers]
+        A13 --> A14[DynamoDB: delete both rules]
+    end
+
+    %% ═══════════════════════════════════════════
+    %% APR (new)
+    %% ═══════════════════════════════════════════
+    subgraph APR["APR — Automatic Payment Requests (daily cron)"]
+        direction TB
+        P1[EventBridge cron<br/>once/day 14:00 UTC] --> P2[Lambda: is-payment-requests]
+        P2 --> P3["@is/mongo Invoice<br/>find({ dueDate: today,<br/>balanceDue > 0,<br/>paymentRequestSentDate: null })"]
+        P3 --> P4["@is/mongo Setting<br/>find({ accountId: {$in}, <br/>key: 'AutomaticPaymentRequests' })"]
+        P4 --> P5["@is/mongo User<br/>find({ accountId: {$in} })<br/>merchant email/name"]
+        P5 --> P6[For each eligible invoice]
+        P6 --> P7[SWU email via @is/messaging]
+        P6 --> P8["Parse SDK: invoice.save()<br/>paymentRequestSentDate (idempotency)"]
+        P6 --> P9["Parse SDK: create Msg<br/>invoice history (best-effort)"]
+    end
+
+    %% Styling
+    style IS_MESSAGES fill:#f9f3e3,stroke:#d4a017
+    style ABANDONED fill:#e3f2fd,stroke:#1976d2
+    style APR fill:#e8f5e9,stroke:#388e3c

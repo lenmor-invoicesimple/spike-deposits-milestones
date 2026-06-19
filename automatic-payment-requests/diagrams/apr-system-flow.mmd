@@ -1,0 +1,50 @@
+---
+title: "APR — System Flow"
+---
+graph LR
+    %% Trigger
+    EB[EventBridge<br/>daily cron 14:00 UTC]
+
+    %% Lambda 1
+    L1[Lambda 1<br/>Sweep + Send]
+
+    %% Data stores
+    MONGO[(MongoDB<br/>Invoice, Setting, User)]
+    PG[(PostgreSQL<br/>msg table)]
+    SQS[[SQS Queue]]
+
+    %% Lambda 2
+    L2[Lambda 2<br/>Parse Writer<br/>×50 concurrent]
+
+    %% External
+    PARSE[(Parse / MongoDB<br/>Msg collection)]
+    EMAIL[is-messages<br/>→ Mailgun]
+    CLIENT((Client<br/>opens email))
+    PIXEL["/px/:hashId"<br/>pixel endpoint]
+
+    %% Flow
+    EB -->|triggers| L1
+    L1 -->|"1. query invoices due today<br/>+ settings + users"| MONGO
+    L1 -->|"2. insertMsg()<br/>→ returns short_id for pixel_url"| PG
+    L1 -->|"3. send email<br/>with pixel_url<br/>(pLimit concurrency)"| EMAIL
+    L1 -->|"4. updateMany<br/>paymentRequestSentDate"| MONGO
+    L1 -->|"5. publish"| SQS
+    SQS -->|"per invoice"| L2
+    L2 -->|"create Msg<br/>'Payment Requested'"| PARSE
+
+    %% Pixel tracking (existing infra)
+    EMAIL -.->|email delivered| CLIENT
+    CLIENT -.->|opens email| PIXEL
+    PIXEL -.->|"creates MsgEvent<br/>'Opened'"| PARSE
+
+    %% Styling
+    style EB fill:#fff3e0,stroke:#f57c00
+    style L1 fill:#e8f5e9,stroke:#388e3c
+    style L2 fill:#e8f5e9,stroke:#388e3c
+    style SQS fill:#fce4ec,stroke:#c62828
+    style MONGO fill:#e3f2fd,stroke:#1565c0
+    style PG fill:#e3f2fd,stroke:#1565c0
+    style PARSE fill:#e3f2fd,stroke:#1565c0
+    style EMAIL fill:#f3e5f5,stroke:#7b1fa2
+    style CLIENT fill:#fff9c4,stroke:#f9a825
+    style PIXEL fill:#f3e5f5,stroke:#7b1fa2
