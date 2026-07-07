@@ -406,7 +406,17 @@ Do NOT ship Path B with just a public checkout URL showing vaulted cards.
 
 ## Item 6: Buyer Portal
 
-_Evaluation pending_
+_Evaluation pending — initial thoughts from convo with Juan (2026-07-06):_
+
+**Auth:** Doesn't need a real login. Can reuse the same 6-digit OTP/token already built for buyer-initiated checkout (see Item 5) — loaded with the same one-time code instead of a password.
+
+**Shape:** A dashboard for the buyer — e.g. shows the invoice(s) they have a vaulted/subscribed card against.
+
+**Bundle with RP:** Recurring Payments needs a client portal anyway (buyers managing their subscribed card, seeing charge history). Building one here overlaps with that need — shared cost, not incremental, if timed together.
+
+**Skepticism — is it worth it for deposits specifically:** For a buyer with just one remaining one-off payment (deposit → balance), a full portal may not add much value. The main upside would be convenience — skip re-entering card details for the next payment — which is a smaller win than the RP case (recurring charges, ongoing relationship).
+
+**Leaning:** Low priority for deposit vaulting v1 on its own; revisit if/when RP's portal work is scheduled, since the auth mechanism (OTP) and dashboard shell could be shared.
 
 ---
 

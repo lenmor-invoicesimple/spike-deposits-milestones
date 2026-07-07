@@ -332,6 +332,24 @@ The link in the email is simply `/v/{documentId}/approve` — the `documentId` i
 | **Invalidation on edit** | If merchant edits and re-sends, new email has same link (same documentId). Page always shows latest estimate version — no stale data risk |
 | **Double-approve race** | Atomic `findOneAndUpdate` with `approvedAt: { $exists: false }` condition — only one caller wins |
 | **Enumeration** | DocumentId is a 24-char hex MongoDB ObjectId — not guessable (same security as current share links) |
+| **Doc limit bypass** | Cloud function MUST check merchant's subscription doc limit before creating the invoice. Without this, buyers could trigger invoice creation that bypasses the paywall gate enforced on web/mobile. Reference: `is-web-app/nextjs/app/(authenticated)/(core)/(documents)/actions/convert-document.action.tsx#L45` |
+
+### Token vs No-Token analysis (Dip review, 2026-06-18)
+
+**Dip's concern:** Public URL + approve button means anyone (including bots) can convert an estimate to an invoice.
+
+**Key insight:** A token does NOT solve the identity problem — it only adds defense-in-depth:
+
+| What a token adds | What a token does NOT add |
+|---|---|
+| Unguessable URL (vs 24-hex ObjectId) | Identity verification (wrong person can still click) |
+| Expiry (e.g. 7 days) | Bot protection (bot with the token still works) |
+| Single-use (consumed on approval) | Forwarding protection (same link, same access) |
+| Revocable by merchant | — |
+
+**Conclusion:** Securing approval to a specific person can only be done with auth (client portal login, OTP, etc). Both token-based and plain URL approaches share the same vulnerability: whoever has the link can approve. The real question is whether approval needs identity verification, or whether checkout (card entry) is the sufficient security boundary.
+
+**Status:** Pending Legal response (Q16) + Product decision on traceability.
 
 ### v2 token alternative (Juan)
 

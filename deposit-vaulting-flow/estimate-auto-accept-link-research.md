@@ -925,6 +925,19 @@ If conversion fails mid-way after `approvedAt` is set:
 > - add a new service that calls conversion logic, and all token lifecycle (DB table with one-time token to estimate IDs)
 > Dip confirmed there's not much to the conversion itself beyond what mobile/web already does — it just needs to be extracted into a shared package
 
+**Follow-up Slack DM to Dip (2026-07-06):** Purpose — gauge whether Payments Growth can own this work, since Dip's team owns the estimate→invoice conversion domain.
+> Hey Dip
+>
+> Liz mentioned that you had an idea re. Estimate -> Invoice conversion — create a one-time unique link which connects that link to an estimate. Once a user clicks the link, we would need to map it to the original estimate and run some kind of conversion from estimate to invoice.
+>
+> Just wanted to explore if this is something we can tackle on PGrowth as part of the Deposits & Milestones work.
+>
+> I checked the existing conversion flow on mobile — the core transform is well-defined, but moving it server-side introduces some complexity around sync, platform differences, and side effects that currently live on-device.
+>
+> Do we have existing patterns for the one-time link and also where could the estimate logic live?
+
+Questions asked are the ones only Dip can answer (existing one-time-link infra, endpoint ownership) — the sync/platform-divergence/numbering complexity behind it is already covered above and doesn't need his input.
+
 ---
 
 ## Effort Estimate (T-shirt)
