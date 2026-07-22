@@ -198,6 +198,41 @@ If we had an existing OTP/verification system, this would be Low. The complexity
 
 ---
 
+## Known Limitations
+
+### Deposits & Milestones CRUD — No Offline Support
+
+All deposit/milestone writes go directly to Parse Cloud Functions with no offline queue:
+
+```typescript
+// manage-payment.screen.tsx:225-244
+try {
+  await savePayment(formValues);     // → Parse.Cloud.run() — requires network
+  loadPayments(remoteInvoiceId);     // → refresh Realm cache AFTER success only
+  await ensureInvoiceInSync(...);
+  navigation.goBack();
+} catch (error) {
+  alertMessage({ message: errorMessages.errorHasOccurred, onPress: navigation.goBack });
+  // ↑ generic error + navigate back — operation is silently lost
+}
+```
+
+Three things that confirm no offline support:
+1. `savePayment()` calls `Parse.Cloud.run()` directly — no local Realm write first
+2. `loadPayments()` only runs after a successful save — Realm is a read cache, not a write queue
+3. `catch` block just shows a generic error and navigates back — no retry, no offline queue
+
+**Contrast with invoices:** Invoices are offline-first (written to Realm locally, bidirectionally synced via `SyncStore`). `RPayment` is explicitly NOT in the sync table list — it's populated only by explicit `loadPayments()` pulls after successful API calls.
+
+**Impact on D&M features:** Any new deposit/milestone work (vaulting, merchant-initiated charge, PIN setup) inherits this same limitation. Adding offline support would require:
+- Adding `RPayment` to the sync engine's table list
+- Writing optimistically to Realm before the Parse call
+- Wiring in the `offlineOkAction` branch (exists in `sync/utils.ts` but not connected here)
+
+This is a non-trivial change, separate from the D&M feature work itself. Treat as a known limitation for v1.
+
+---
+
 ## Stakeholder Sync Notes (Jun 11–15, 2026)
 
 ### #1 — One-Step Deposit Creation

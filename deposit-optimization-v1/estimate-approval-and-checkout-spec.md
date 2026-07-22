@@ -1,10 +1,22 @@
 # Estimate Approval & Checkout — Specification (v2)
 
 **Date:** 2026-07-07
-**Status:** Draft — revised based on new designs + Seth/Juan direction
+**Status:** ⚠️ **SUPERSEDED (2026-07-14)** — see banner below.
 **Epic:** IS-11250 — Deposit Optimization v1
 **Supersedes:** `../deposit-vaulting-flow/estimate-auto-accept-link-spec.md` (2026-06-17)
 **PRD Reference:** [Deposits Optimizations PRD](https://everpro-tech.atlassian.net/wiki/x/JoBRS)
+
+> ## ⚠️ SUPERSEDED — DO NOT IMPLEMENT FROM THIS DOC
+> The **2026-07-14 design meeting (Liz) reversed the core architecture** in this spec. This entire doc is built on the **pay-first / convert-after-payment (webhook)** model — that model is **dead**. Current source of truth: [`enable-payments-on-estimates.md`](./enable-payments-on-estimates.md) (see its "SUPERSEDING UPDATE" block) + [`block-b-global-vs-document-level.md`](./block-b-global-vs-document-level.md).
+>
+> What changed:
+> - **Conversion timing:** this doc says conversion fires **after payment succeeds** (webhook). ❌ Final flow is **convert-first at "Pay Now"** — a synchronous Parse Cloud Function converts estimate→invoice *before* payment, so the PaymentIntent runs against the invoice id (for L2/L3).
+> - **Payment target:** this doc says "buyer pays the estimate directly." ❌ Buyer pays the **invoice** (minted on the Pay Now click).
+> - **Orphaned-invoice / payment-carryover reasoning:** obviated — no payment ever lands on the estimate under convert-first.
+> - **Post-conversion link:** this doc's guards table says "redirect to existing invoice checkout." ❌ Final decision (block C): redirect to the **read-only public estimate URL, NOT** checkout.
+> - **Multiple conversions:** locked to strict **1:1 in v1** (block D); reuse = duplicate.
+>
+> Retained for history: the signature-approval UX, service-boundary map, and effort breakdown are still useful reference; the *timing/target* architecture is not.
 
 ---
 
@@ -153,7 +165,7 @@ Payment success webhook/callback
 
 | Concern | How it's handled |
 |---------|-----------------|
-| **Single conversion (buyer flow)** | Check if estimate already has a linked invoice from buyer flow. If yes, redirect to existing invoice checkout or show "already converted" |
+| **Single conversion (buyer flow)** | ⚠️ **SUPERSEDED (block C, 2026-07-14):** if already converted, redirect to the **read-only public estimate URL, NOT** the invoice checkout (prevents wrong-customer-gets-wrong-invoice). QR + Pay Deposit CTA hidden. ~~redirect to existing invoice checkout~~ |
 | **Double-payment race** | Atomic check in payment webhook — if conversion already triggered, skip. Stripe's idempotency key also helps |
 | **Expiry** | Check estimate's `sentAt` or `updatedAt` — if older than threshold (30 days?), show "link expired" |
 | **Invalidation on edit** | Page always shows latest estimate version — no stale data. If merchant edits after buyer signed but before payment, show warning? (TBD) |

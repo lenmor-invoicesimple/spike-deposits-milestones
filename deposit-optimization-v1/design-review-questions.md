@@ -4,6 +4,8 @@
 **Date:** 2026-07-07
 **Status:** In review — questions for Liz/Seth
 
+> ⚠️ **PARTIALLY SUPERSEDED (2026-07-14).** The 2026-07-14 design meeting locked the flow architecture and answered/overrode several of these. Notably: **conversion is now convert-first at "Pay Now"** (before payment), not "after payment" — so any answer here framed around post-payment conversion (e.g. Q9) is stale. **One estimate → multiple invoices is off the table for v1 (strict 1:1; reuse = duplicate)** — so Q11's premise no longer holds. Post-conversion old links redirect to the read-only public estimate URL, not checkout. Source of truth for the flow: [`enable-payments-on-estimates.md`](./enable-payments-on-estimates.md) + [`block-b-global-vs-document-level.md`](./block-b-global-vs-document-level.md). Deposit-CRUD questions (Screen 1) remain useful.
+
 ---
 
 ## Screen 1: Estimate Deposit Setup (Merchant Editor)
@@ -54,7 +56,7 @@
    - Does scanning the QR skip the signature step and go directly to checkout? If so, signature isn't actually required to pay.
    - If signature IS required, should the QR land on the same review page (with Sign button), making the QR just an entry point equivalent to the email link?
 
-9. **~~"Continue To Deposit" after signing~~** — ANSWERED (Seth, 2026-07-07): Conversion happens AFTER payment, not at signing. If buyer signs but abandons before paying, estimate stays unconverted. No orphaned invoices. Juan confirmed: "buyer pays deposit first, then convert estimate to payable invoice once transaction's complete."
+9. **~~"Continue To Deposit" after signing~~** — ~~ANSWERED (Seth, 2026-07-07): Conversion happens AFTER payment, not at signing.~~ ⚠️ **RE-SUPERSEDED (2026-07-14):** the final flow is **convert-first at "Pay Now"** — conversion fires on the Pay Now click, *before* payment (to mint the invoice id for L2/L3). The "no orphaned invoices" goal still holds (you can't reach Pay Now without intent to pay), but the "conversion happens after payment" mechanic is no longer correct. See [`enable-payments-on-estimates.md`](./enable-payments-on-estimates.md) block A.
 
 10. **~~No-signature flow CTA~~** — ANSWERED (Seth, 2026-07-07): CTA is "Approve & Pay" — implies buyer is approving the estimate by making the deposit payment. No separate approve step needed. Premium users get Sign → Continue To Deposit. Non-Premium users get "Approve & Pay" directly.
 
@@ -73,7 +75,7 @@
 
 ### Questions
 
-11. **Multiple conversions** — The modal shows 3 invoices from one estimate. Is this combining buyer-initiated conversions AND merchant manual "Make Invoice" into one list? Or can the buyer approve + convert the same estimate multiple times (e.g., milestone payments)?
+11. **~~Multiple conversions~~** — ⚠️ **RESOLVED (block D, 2026-07-14): strict 1:1 in v1.** Once converted (manually or by buyer), the estimate is locked — no further conversions, no further payments. Manual "Convert to Invoice" is hidden after first conversion; user is prompted to **duplicate** to reuse. The `convertedTo` field stays an array to future-proof for milestones, but v1 only ever creates one invoice, so the modal renders a single entry. The "3 invoices from one estimate" mock is future-state, not v1.
 
 12. **Estimate state after conversion** — Does the estimate stay "Open" for re-use, or move to a "Converted"/"Closed" state? Can merchant still edit and re-send it after a conversion?
 

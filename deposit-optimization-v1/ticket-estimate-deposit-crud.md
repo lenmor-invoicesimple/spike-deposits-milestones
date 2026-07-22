@@ -159,15 +159,27 @@ This means: **don't embed estimate-specific logic in the component**. Keep it pu
 
 | # | Ticket | Scope | Dependencies |
 |---|--------|-------|--------------|
-| 1 | **Packages — Enable deposit fields for estimates** | Extend `EstimateSettings` type in domain-invoicing; add deposit fields to `getEstimateSettings()` mapping in parse-domain | None — prerequisite for all others |
-| 2 | **Mobile — Enable Online Payment Fee on estimates** | Remove docType guard in `invoice-payments-passing-fees-section.tsx:85`; update tracking hook in `use-track-surcharge-awareness.ts:23` | None — independent, can ship anytime |
-| 3 | **Mobile — Request Deposit UI component** | New `RequestDepositSection` component (toggle + type selector + amount input); 50% max cap on percentage; build docType-agnostic for future Invoice reuse | Depends on #1 |
-| 4 | **Mobile — Estimate totals update (Payments row + Deposit Due)** | Add "Payments" row to estimate totals (currently invoice-only); show "Deposit Due" instead of "Balance Due" when deposit is configured | Depends on #3 |
-| 5 | **Feature flag — Gate estimate deposit behind Flagsmith flag** | New Flagsmith flag (e.g. `estimate_deposit_enabled`) to control visibility of Request Deposit toggle + Deposit Due totals; allows gradual rollout and kill switch | None — can be created early, wired into #3 and #4 |
+| 1 | **Mobile — Enable Online Payment Fee on estimates** | Remove docType guard in `invoice-payments-passing-fees-section.tsx:85`; update tracking hook in `use-track-surcharge-awareness.ts:23` | None — independent, can ship anytime |
+| 2 | **Mobile — Request Deposit UI component** | New `RequestDepositSection` component (toggle + type selector + amount input); 50% max cap on percentage; build docType-agnostic for future Invoice reuse | None — mobile bypasses is-packages |
+| 3 | **Mobile — Estimate totals update (Payments row + Deposit Due)** | Add "Payments" row to estimate totals (currently invoice-only); show "Deposit Due" instead of "Balance Due" when deposit is configured | Depends on #2 |
+| 4 | **Feature flag — Gate estimate deposit behind Flagsmith flag** | New Flagsmith flag (e.g. `estimate_deposit_enabled`) to control visibility of Request Deposit toggle + Deposit Due totals; allows gradual rollout and kill switch | None — can be created early, wired into #2 and #3 |
+| 5 | **Web — Enable deposit fields for estimates in is-packages** | Extend `EstimateSettings` type in `domain-invoicing`; add deposit fields to `getEstimateSettings()` mapping in `parse-domain` | None — only needed when web estimate editor adds deposit support |
 
 **Dependency chain:**
 ```
-#1 (packages) ─→ #3 (deposit UI) ─→ #4 (totals)
-#2 (surcharge)  ← independent
-#5 (flag)       ← wired into #3 and #4
+#2 (deposit UI) ─→ #3 (totals)
+#1 (surcharge)   ← independent
+#4 (flag)        ← wired into #2 and #3
+#5 (web packages) ← deferred, not needed for mobile
 ```
+
+### Why is-packages is NOT a blocker for mobile
+
+Mobile has its own Parse mapping layer that bypasses `is-packages/parse-domain` entirely:
+- **Read path:** `createInvoiceFromParseInvoice()` in `services/parse/models/invoice.ts` uses `...setting` spread — captures ALL Parse fields including `depositType/Rate/Amount` without needing explicit extraction
+- **Write path:** `createParseInvoiceFromInvoice()` explicitly handles deposit fields with omit/include logic based on `depositType !== NONE`
+- **Realm schema:** Already has `depositType`, `depositRate`, `depositAmount` as optional fields
+
+The `getEstimateSettings()` function in `is-packages/parse-domain` (which omits deposit fields) and the `EstimateSettings` type in `is-packages/domain-invoicing` (which excludes deposit fields) are only used by the **web app** (`is-web-app`). Mobile never imports or calls these functions.
+
+Ticket #5 is only needed when we build deposit support into the web estimate editor.
